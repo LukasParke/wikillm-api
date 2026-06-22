@@ -1,0 +1,890 @@
+openapi: 3.1.0
+info:
+  title: WikiLLM API
+  description: |-
+    HTTP API for [wiki-llm](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)
+    folders. Designed to run alongside Obsidian, git, LiveSync, and other sync tools while
+    serving multiple users and agents from the same markdown wiki.
+
+    ## Project links
+
+    - [GitHub repository](https://github.com/LukasParke/wikillm-api)
+    - [Docker image](https://github.com/LukasParke/wikillm-api/pkgs/container/wikillm-api)
+    - [Deployment guide](https://github.com/LukasParke/wikillm-api#deployment)
+    - [Architecture docs](https://github.com/LukasParke/wikillm-api/blob/main/docs/ARCHITECTURE.md)
+
+    ## Features
+
+    - Filesystem remains the source of truth
+    - Atomic writes with optimistic concurrency control
+    - Multi-source API key attribution
+    - SSE and WebSocket live change feeds
+    - Batch ingestion of sources and wiki pages
+  version: 0.1.0
+  contact:
+    name: WikiLLM API
+    url: https://github.com/LukasParke/wikillm-api
+  license:
+    name: MIT
+    url: https://github.com/LukasParke/wikillm-api/blob/main/LICENSE
+
+servers:
+  - url: http://localhost:3000
+    description: Local development server
+
+tags:
+  - name: Health
+    description: Service status
+  - name: Pages
+    description: Wiki page CRUD with optimistic concurrency control
+  - name: Sources
+    description: Immutable raw source documents
+  - name: Index
+    description: Wiki catalog (index.md)
+  - name: Log
+    description: Activity log (log.md)
+  - name: Search
+    description: Search wiki pages
+  - name: Changes
+    description: File-system change feed
+  - name: Live Events
+    description: SSE and WebSocket change streams
+  - name: Ingest
+    description: Batch ingestion of sources and wiki pages
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        API key passed as a Bearer token. Keys are configured via the API_KEYS environment variable.
+
+  schemas:
+    Page:
+      type: object
+      required:
+        - rel_path
+        - abs_path
+        - title
+        - summary
+        - frontmatter
+        - body
+        - word_count
+        - outgoing_links
+        - hash
+        - mtime
+        - updated_at
+        - updated_by
+      properties:
+        rel_path:
+          type: string
+          example: wiki/entities/OpenAI.md
+        abs_path:
+          type: string
+          example: /wiki/wiki/entities/OpenAI.md
+        title:
+          type: string
+          nullable: true
+          example: OpenAI
+        summary:
+          type: string
+          nullable: true
+        frontmatter:
+          type: object
+          example:
+            tags:
+              - ai
+            updated_at: "2026-06-22T21:30:25.762Z"
+            updated_by: agent-codex
+        body:
+          type: string
+          example: "# OpenAI\n\nOpenAI is an AI research company."
+        word_count:
+          type: integer
+          example: 7
+        outgoing_links:
+          type: array
+          items:
+            type: string
+          example:
+            - "[[Sam Altman]]"
+        hash:
+          type: string
+          description: SHA-256 of the file content
+          example: c7bcc0f1215169cee45e9eed89792a5f955aa63621405a56a0fa8ff2de424eea
+        mtime:
+          type: number
+          description: File modification time in milliseconds
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+        updated_by:
+          type: string
+          nullable: true
+          example: agent-codex
+
+    PageList:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Page"
+        nextCursor:
+          type: string
+          nullable: true
+
+    PageWriteInput:
+      type: object
+      required:
+        - content
+      properties:
+        content:
+          type: string
+          description: Markdown body of the page
+        frontmatter:
+          type: object
+          description: |
+            YAML frontmatter fields. updated_at and updated_by are auto-injected if absent.
+        ifMatch:
+          type: string
+          nullable: true
+          description: |
+            SHA-256 hash of the current file content. Required for updates; omit for creates.
+
+    PageWriteResult:
+      type: object
+      required:
+        - success
+      properties:
+        success:
+          type: boolean
+        page:
+          $ref: "#/components/schemas/Page"
+        operationId:
+          type: string
+
+    SourceFile:
+      type: object
+      required:
+        - rel_path
+        - abs_path
+        - content_type
+        - size
+        - hash
+        - mtime
+      properties:
+        rel_path:
+          type: string
+          example: raw/articles/example.md
+        abs_path:
+          type: string
+        content_type:
+          type: string
+          nullable: true
+          example: text/markdown
+        size:
+          type: integer
+          example: 1234
+        hash:
+          type: string
+        mtime:
+          type: number
+
+    SourceList:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/SourceFile"
+        nextCursor:
+          type: string
+          nullable: true
+
+    Conflict:
+      type: object
+      required:
+        - hash
+        - content
+      properties:
+        hash:
+          type: string
+        content:
+          type: string
+
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          example: conflict
+        message:
+          type: string
+        current:
+          $ref: "#/components/schemas/Conflict"
+        existingHash:
+          type: string
+
+    ChangeEvent:
+      type: object
+      required:
+        - type
+        - data
+      properties:
+        type:
+          type: string
+          enum:
+            - change
+        data:
+          type: object
+          required:
+            - id
+            - rel_path
+            - change_type
+            - detected_at
+          properties:
+            id:
+              type: string
+            rel_path:
+              type: string
+            change_type:
+              type: string
+              enum:
+                - created
+                - modified
+                - deleted
+                - renamed
+            old_hash:
+              type: string
+              nullable: true
+            new_hash:
+              type: string
+              nullable: true
+            source:
+              type: string
+              nullable: true
+              description: Source name for API writes, null for external changes
+              example: agent-codex
+            operation_id:
+              type: string
+              nullable: true
+            detected_at:
+              type: string
+              format: date-time
+
+    IngestInput:
+      type: object
+      required:
+        - source
+        - operations
+      properties:
+        source:
+          type: object
+          required:
+            - title
+            - rel_path
+          properties:
+            title:
+              type: string
+            rel_path:
+              type: string
+              example: raw/article-a.md
+            content:
+              type: string
+        operations:
+          type: array
+          items:
+            $ref: "#/components/schemas/PageWriteInput"
+        logEntry:
+          type: string
+        refreshIndex:
+          type: boolean
+          default: true
+
+    IngestResult:
+      type: object
+      required:
+        - success
+        - operationId
+        - results
+      properties:
+        success:
+          type: boolean
+        operationId:
+          type: string
+        results:
+          type: array
+          items:
+            type: object
+            required:
+              - rel_path
+              - success
+            properties:
+              rel_path:
+                type: string
+              success:
+                type: boolean
+              conflict:
+                $ref: "#/components/schemas/Conflict"
+
+    LogEntry:
+      type: object
+      required:
+        - timestamp
+        - source
+        - message
+        - raw
+      properties:
+        timestamp:
+          type: string
+        source:
+          type: string
+        message:
+          type: string
+        raw:
+          type: string
+
+paths:
+  /health:
+    get:
+      tags:
+        - Health
+      summary: Health check
+      description: Returns service status, version, and configured wiki root.
+      security: []
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - status
+                  - version
+                  - wiki_root
+                  - public_read
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  version:
+                    type: string
+                  wiki_root:
+                    type: string
+                  public_read:
+                    type: boolean
+
+  /v1/pages:
+    get:
+      tags:
+        - Pages
+      summary: List wiki pages
+      description: List pages from the SQLite cache with optional pagination.
+      parameters:
+        - name: folder
+          in: query
+          schema:
+            type: string
+            default: wiki
+          description: Relative folder to list from
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 50
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Path to start after for pagination
+      responses:
+        "200":
+          description: List of pages
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PageList"
+
+  /v1/pages/{rel_path}:
+    parameters:
+      - name: rel_path
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Relative path of the page, e.g. wiki/entities/OpenAI.md
+        example: wiki/entities/OpenAI.md
+
+    get:
+      tags:
+        - Pages
+      summary: Read a wiki page
+      responses:
+        "200":
+          description: Page found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Page"
+        "404":
+          description: Page not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+    put:
+      tags:
+        - Pages
+      summary: Create or update a wiki page
+      description: |
+        Writes a page atomically. If the page exists, ifMatch must match the current
+        SHA-256 hash or a 409 conflict is returned.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PageWriteInput"
+      responses:
+        "200":
+          description: Page written successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PageWriteResult"
+        "409":
+          description: Optimistic concurrency conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+    delete:
+      tags:
+        - Pages
+      summary: Delete a wiki page
+      description: |
+        Deletes a page. If an If-Match header is provided and does not match the current
+        hash, a 409 conflict is returned.
+      parameters:
+        - name: If-Match
+          in: header
+          schema:
+            type: string
+          description: SHA-256 hash of the current content
+      responses:
+        "200":
+          description: Page deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - success
+                  - operationId
+                properties:
+                  success:
+                    type: boolean
+                  operationId:
+                    type: string
+        "404":
+          description: Page not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: Optimistic concurrency conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/sources:
+    get:
+      tags:
+        - Sources
+      summary: List raw sources
+      parameters:
+        - name: folder
+          in: query
+          schema:
+            type: string
+            default: raw
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 50
+        - name: cursor
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: List of sources
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SourceList"
+
+  /v1/sources/{rel_path}:
+    parameters:
+      - name: rel_path
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Relative path of the source, e.g. raw/articles/example.md
+        example: raw/articles/example.md
+
+    get:
+      tags:
+        - Sources
+      summary: Read source metadata
+      responses:
+        "200":
+          description: Source metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SourceFile"
+        "404":
+          description: Source not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+    post:
+      tags:
+        - Sources
+      summary: Upload a raw source
+      description: |
+        Sources are write-once by default. Use ?force=true to overwrite an existing source.
+      parameters:
+        - name: force
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Overwrite if source already exists
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                content:
+                  type: string
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+          text/plain:
+            schema:
+              type: string
+      responses:
+        "201":
+          description: Source created or overwritten
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SourceFile"
+        "409":
+          description: Source already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+    delete:
+      tags:
+        - Sources
+      summary: Delete a raw source
+      responses:
+        "200":
+          description: Source deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - success
+                properties:
+                  success:
+                    type: boolean
+        "404":
+          description: Source not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/index:
+    get:
+      tags:
+        - Index
+      summary: Read index.md
+      description: |
+        Returns the raw markdown content and the structured catalog of pages used to generate it.
+      responses:
+        "200":
+          description: Index content and page catalog
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - content
+                  - pages
+                properties:
+                  content:
+                    type: string
+                  pages:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Page"
+
+    post:
+      tags:
+        - Index
+      summary: Regenerate index.md
+      description: Rebuilds index.md from the current page cache.
+      responses:
+        "200":
+          description: Index refreshed
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - operationId
+                  - pageCount
+                properties:
+                  operationId:
+                    type: string
+                  pageCount:
+                    type: integer
+
+  /v1/log:
+    get:
+      tags:
+        - Log
+      summary: Read log.md
+      responses:
+        "200":
+          description: Log content and structured entries
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - content
+                  - entries
+                properties:
+                  content:
+                    type: string
+                  entries:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/LogEntry"
+
+  /v1/log/append:
+    post:
+      tags:
+        - Log
+      summary: Append to log.md
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - message
+              properties:
+                message:
+                  type: string
+                prefix:
+                  type: string
+      responses:
+        "201":
+          description: Entry appended
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - operationId
+                  - entry
+                properties:
+                  operationId:
+                    type: string
+                  entry:
+                    type: string
+
+  /v1/search:
+    get:
+      tags:
+        - Search
+      summary: Search wiki pages
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Search query
+        - name: in
+          in: query
+          schema:
+            type: string
+            enum:
+              - title
+              - body
+              - frontmatter
+          description: Field to search in
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - query
+                  - in
+                  - results
+                properties:
+                  query:
+                    type: string
+                  in:
+                    type: string
+                  results:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Page"
+
+  /v1/changes:
+    get:
+      tags:
+        - Changes
+      summary: Recent changes feed
+      description: Returns API-initiated and externally detected filesystem changes.
+      parameters:
+        - name: since
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: ISO-8601 timestamp
+        - name: path
+          in: query
+          schema:
+            type: string
+        - name: source
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        "200":
+          description: Changes feed
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - changes
+                properties:
+                  changes:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ChangeEvent"
+
+  /v1/events:
+    get:
+      tags:
+        - Live Events
+      summary: Server-Sent Events stream
+      description: Subscribe to filesystem change events as a text/event-stream.
+      responses:
+        "200":
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/ChangeEvent"
+
+  /v1/ws:
+    get:
+      tags:
+        - Live Events
+      summary: WebSocket stream
+      description: |
+        Subscribe to filesystem change events over a WebSocket.
+        Send {"type":"ping"} to receive a pong.
+      responses:
+        "101":
+          description: WebSocket upgrade
+
+  /v1/ingest:
+    post:
+      tags:
+        - Ingest
+      summary: Batch ingestion
+      description: |
+        Upload a source and update multiple wiki pages atomically.
+        Optionally append to log.md and refresh index.md.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IngestInput"
+      responses:
+        "200":
+          description: Ingest succeeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestResult"
+        "409":
+          description: One or more page updates conflicted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestResult"

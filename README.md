@@ -162,11 +162,39 @@ ghcr.io/lukasparke/wikillm-api:main
 ghcr.io/lukasparke/wikillm-api:<semver>
 ```
 
+## API documentation
+
+Interactive OpenAPI reference is published on GitHub Pages:
+
+**https://lukasparke.github.io/wikillm-api/**
+
+The spec is also available at [`docs/openapi.yaml`](docs/openapi.yaml).
+
 ## Running tests
 
 ```bash
 bun run test:run
 ```
+
+## Benchmarks
+
+A local benchmark using [autocannon](https://github.com/mcollina/autocannon) is included:
+
+```bash
+bash scripts/benchmark.sh
+```
+
+Measured on a Ryzen 9 7950X3D / 62 GiB / Bun 1.3.13:
+
+| Endpoint                             | Concurrency |    Throughput | p99 latency |
+| ------------------------------------ | ----------: | ------------: | ----------: |
+| `GET /health`                        |         200 | ~95,000 req/s |        4 ms |
+| `GET /v1/pages/wiki/...`             |         100 | ~45,000 req/s |       11 ms |
+| `PUT /v1/pages/wiki/...` (same page) |          10 |  ~4,900 req/s |        3 ms |
+| `POST /v1/ingest`                    |           1 |    ~800 ops/s |        2 ms |
+| `PUT /v1/pages/wiki/{unique}.md`     |           1 |    ~929 req/s |           — |
+
+See [`scripts/benchmark-results.md`](scripts/benchmark-results.md) for full details and raw output.
 
 ## Coexistence with Obsidian, git, and sync tools
 
