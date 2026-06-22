@@ -123,13 +123,44 @@ ws.onmessage = (event) => {
 };
 ```
 
-## Running with Docker
+## Deployment
+
+### Docker Compose (recommended)
+
+1. Copy `.env.example` to `.env` and configure at least `API_KEYS`.
+2. Set `WIKI_PATH` to your wiki folder:
+   - Local folder: `WIKI_PATH=./wiki`
+   - Remote/network mount on the host: `WIKI_PATH=/mnt/nas/wiki`
+3. Deploy:
 
 ```bash
-docker compose up --build
+# Using the helper script
+./scripts/deploy.sh
+
+# Or manually
+docker compose up -d
 ```
 
-Mount your wiki folder into `/wiki`.
+### Docker run
+
+```bash
+docker run -d -p 3000:3000 \
+  -v /path/to/wiki:/wiki \
+  -e WIKI_ROOT=/wiki \
+  -e API_KEYS='agent-codex:secret,user-luke:secret2' \
+  -e PUBLIC_READ=true \
+  ghcr.io/lukasparke/wikillm-api:latest
+```
+
+### Published image
+
+CI automatically builds and publishes to:
+
+```
+ghcr.io/lukasparke/wikillm-api:latest
+ghcr.io/lukasparke/wikillm-api:main
+ghcr.io/lukasparke/wikillm-api:<semver>
+```
 
 ## Running tests
 

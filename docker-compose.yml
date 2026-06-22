@@ -1,14 +1,24 @@
 services:
   wikillm-api:
+    image: ${IMAGE:-ghcr.io/lukasparke/wikillm-api}:${TAG:-latest}
     build: .
     ports:
-      - "3000:3000"
+      - "${PORT:-3000}:3000"
     environment:
       - WIKI_ROOT=/wiki
-      - API_KEYS=agent-codex:${CODEX_KEY:-codex-key-xxx},user-luke:${LUKE_KEY:-luke-key-yyy}
-      - PUBLIC_READ=true
+      - API_KEYS=${API_KEYS}
+      - PUBLIC_READ=${PUBLIC_READ:-true}
       - DB_PATH=/wiki/.wikillm-api.db
-      - LOG_LEVEL=info
+      - LOG_LEVEL=${LOG_LEVEL:-info}
     volumes:
-      - ./wiki:/wiki
+      # Local directory mount (default)
+      - ${WIKI_PATH:-./wiki}:/wiki
+      # Or mount a remote/network filesystem path from the host:
+      # - /mnt/nas/wiki:/wiki
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
