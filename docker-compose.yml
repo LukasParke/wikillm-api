@@ -1,0 +1,14 @@
+services:
+  wikillm-api:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - WIKI_ROOT=/wiki
+      - API_KEYS=agent-codex:${CODEX_KEY:-codex-key-xxx},user-luke:${LUKE_KEY:-luke-key-yyy}
+      - PUBLIC_READ=true
+      - DB_PATH=/wiki/.wikillm-api.db
+      - LOG_LEVEL=info
+    volumes:
+      - ./wiki:/wiki
+    restart: unless-stopped
