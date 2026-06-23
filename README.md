@@ -178,13 +178,14 @@ bun run test:run
 
 ## Benchmarks
 
-A local benchmark using [autocannon](https://github.com/mcollina/autocannon) is included:
+Two benchmark scripts are included:
 
-```bash
-bash scripts/benchmark.sh
-```
+- `bash scripts/benchmark.sh` — synthetic peak-throughput tests with [autocannon](https://github.com/mcollina/autocannon).
+- `bun run scripts/benchmark-realistic.ts` — realistic mixed-workload scenarios with think times, a seeded wiki, and varied client behaviors.
 
 Measured on a Ryzen 9 7950X3D / 62 GiB / Bun 1.3.13:
+
+### Synthetic peak throughput
 
 | Endpoint                             | Concurrency |    Throughput | p99 latency |
 | ------------------------------------ | ----------: | ------------: | ----------: |
@@ -193,6 +194,16 @@ Measured on a Ryzen 9 7950X3D / 62 GiB / Bun 1.3.13:
 | `PUT /v1/pages/wiki/...` (same page) |          10 |  ~4,900 req/s |        3 ms |
 | `POST /v1/ingest`                    |           1 |    ~800 ops/s |        2 ms |
 | `PUT /v1/pages/wiki/{unique}.md`     |           1 |    ~929 req/s |           — |
+
+### Realistic workload
+
+| Scenario            | Clients | Think time |   Throughput | p99 latency |
+| ------------------- | ------: | ---------: | -----------: | ----------: |
+| Read-heavy browsing |     100 |       50ms | ~3,700 req/s |       16 ms |
+| Mixed read/write    |      50 |      100ms |   ~970 req/s |        8 ms |
+| Write-heavy editing |      25 |       50ms |   ~190 req/s |        1 ms |
+| Batch ingestion     |       3 |      200ms |    ~19 ops/s |       42 ms |
+| Observer polling    |      10 |      500ms |     ~7 req/s |    2,750 ms |
 
 See [`scripts/benchmark-results.md`](scripts/benchmark-results.md) for full details and raw output.
 

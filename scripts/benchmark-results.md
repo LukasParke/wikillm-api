@@ -27,6 +27,19 @@ Run on the local development machine using [autocannon](https://github.com/mcoll
 | `POST /v1/ingest`                    |           1 |     ~800 req/s |     0.09 ms |        2 ms |
 | `PUT /v1/pages/wiki/{unique}.md`     |           1 |     ~929 req/s |           — |           — |
 
+## Realistic workload benchmarks
+
+`scripts/benchmark-realistic.ts` seeds a 100-page, 20-source wiki and runs
+probabilistic clients with think times to mimic real traffic patterns.
+
+| Scenario                                                  | Clients | Think time |   Throughput | p99 latency |
+| --------------------------------------------------------- | ------: | ---------: | -----------: | ----------: |
+| Read-heavy browsing (health + pages + search)             |     100 |      50 ms | ~3,700 req/s |       16 ms |
+| Mixed read/write (70% reads / 30% writes)                 |      50 |     100 ms |   ~970 req/s |        8 ms |
+| Write-heavy editing (updates + new notes + sources + log) |      25 |      50 ms |   ~190 req/s |        1 ms |
+| Batch ingestion (source + 2 pages + log + index refresh)  |       3 |     200 ms |    ~19 ops/s |       42 ms |
+| Observer polling changes/index refresh                    |      10 |     500 ms |     ~7 req/s |    2,750 ms |
+
 ## Raw autocannon output
 
 ```
@@ -77,8 +90,18 @@ POST /v1/ingest | concurrency=1
 
 ## Observations
 
-- Read-heavy endpoints (`/health`, `GET /v1/pages/...`) scale to tens of thousands of requests per second.
-- Writes to the same file are serialized by the per-path lock; throughput plateaus around **5k req/s** for a single hot page.
-- Creating unique pages is bound by filesystem/metadata overhead; expect **~900 req/s** for sustained unique file creation.
-- Batch ingest writes a source, multiple pages, appends `log.md`, and refreshes `index.md`; it runs at **~800 ingest ops/s** for a single client.
-- Real-world throughput will vary based on disk speed, filesystem type, number of files in the wiki, and whether external tools (Obsidian, sync clients) are also accessing the folder.
+- Read-heavy endpoints (`/health`, `GET /v1/pages/...`) scale to tens of thousands of
+  requests per second under synthetic load.
+- Realistic browsing with think times yields ~3,700 req/s for a mix of health checks,
+  page reads, list requests, and search queries.
+- Writes to the same file are serialized by the per-path lock; throughput plateaus around
+  **5k req/s** for a single hot page under synthetic load, and drops to ~190 req/s in a
+  realistic write-heavy mix that also creates new files and appends to the log.
+- Creating unique pages is bound by filesystem/metadata overhead; expect **~900 req/s**
+  for sustained unique file creation.
+- Batch ingest writes a source, multiple pages, appends `log.md`, and refreshes `index.md`;
+  realistic throughput is **~19 ingest ops/s** with a small number of concurrent agents.
+- Observer-style polling (changes + periodic index refresh) is intentionally low-frequency
+  and bounded by index refresh cost; p99 latency is dominated by the refresh operation.
+- Real-world throughput will vary based on disk speed, filesystem type, number of files in
+  the wiki, and whether external tools (Obsidian, sync clients) are also accessing the folder.
