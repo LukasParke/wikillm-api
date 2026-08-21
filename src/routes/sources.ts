@@ -22,7 +22,9 @@ app.get("/", validateQuery(querySchema), async (c) => {
 });
 
 app.get("/:rel_path{.+}", async (c) => {
-  const relPath = c.req.param("rel_path");
+  const contentMode = c.req.path.endsWith("/content");
+  const rawRel = c.req.param("rel_path");
+  const relPath = contentMode ? rawRel.slice(0, -"/content".length) : rawRel;
   const service = createSourceService(c.get("deps"), c.get("source"));
   const source = await service.get(relPath);
   if (!source)
@@ -30,6 +32,20 @@ app.get("/:rel_path{.+}", async (c) => {
       { error: "not_found", message: `Source not found: ${relPath}` },
       404,
     );
+  if (contentMode) {
+    const { readSourceBuffer } = await import("../fs/wiki.js");
+    const buffer = readSourceBuffer(c.get("config").WIKI_ROOT, relPath);
+    if (!buffer) {
+      return c.json(
+        { error: "not_found", message: "File missing on disk" },
+        404,
+      );
+    }
+    return c.body(new Uint8Array(buffer), 200, {
+      "Content-Type": source.content_type ?? "application/octet-stream",
+      ETag: `"${source.hash}"`,
+    });
+  }
   return c.json(source);
 });
 
@@ -37,12 +53,29 @@ app.post("/:rel_path{.+}", async (c) => {
   const relPath = c.req.param("rel_path");
   const force = c.req.query("force") === "true";
   const contentType = c.req.header("content-type") ?? "";
+  const maxBytes =
+    ((await c.get("deps").settings.get<number>("max_upload_mb")) ?? 100) *
+    1024 *
+    1024;
+  const declared = Number(c.req.header("content-length") ?? 0);
+  if (declared > maxBytes) {
+    return c.json(
+      { error: "too_large", message: `Upload exceeds ${maxBytes} bytes` },
+      413,
+    );
+  }
   let body: Buffer | string;
   if (contentType.startsWith("application/json")) {
     const json = await c.req.json();
     body = json.content ?? "";
   } else {
     body = Buffer.from(await c.req.arrayBuffer());
+    if (body.length > maxBytes) {
+      return c.json(
+        { error: "too_large", message: `Upload exceeds ${maxBytes} bytes` },
+        413,
+      );
+    }
   }
   const service = createSourceService(c.get("deps"), c.get("source"));
   const result = await service.write({

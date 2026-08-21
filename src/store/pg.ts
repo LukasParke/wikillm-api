@@ -9,6 +9,7 @@ import {
   type ApiKeyRecord,
   type ApiKeyUpsert,
   type SettingsMap,
+  type WebhookRecord,
   type ChunkHit,
   type ChunkInput,
   type ChunkRecord,
@@ -190,6 +191,16 @@ export function pgSchemaStatements(dims: number): string[] {
        error TEXT
      )`,
     `CREATE INDEX IF NOT EXISTS idx_queries_created ON queries(created_at)`,
+    `CREATE TABLE IF NOT EXISTS webhooks (
+       id TEXT PRIMARY KEY,
+       url TEXT NOT NULL,
+       events JSONB NOT NULL DEFAULT '["change"]',
+       prefixes JSONB NOT NULL DEFAULT '["*"]',
+       enabled BOOLEAN NOT NULL DEFAULT TRUE,
+       last_status TEXT,
+       last_attempt_at TEXT,
+       created_at TEXT NOT NULL
+     )`,
     `CREATE TABLE IF NOT EXISTS settings (
        key TEXT PRIMARY KEY,
        value JSONB NOT NULL,
@@ -393,13 +404,12 @@ export class PostgresStore implements Store {
   }
 
   async listDocuments(opts: ListOptions): Promise<Page<DocumentRecord>> {
-    const folder = opts.folder ?? "";
     const limit = opts.limit ?? 50;
     const conds: string[] = [];
     const params: unknown[] = [];
-    if (folder) {
+    if (opts.folder) {
       conds.push(`rel_path LIKE $${params.length + 1}`);
-      params.push(`${folder}/%`);
+      params.push(`${opts.folder}/%`);
     }
     if (opts.kind) {
       conds.push(`kind = $${params.length + 1}`);
@@ -412,6 +422,16 @@ export class PostgresStore implements Store {
     if (opts.cursor) {
       conds.push(`rel_path > $${params.length + 1}`);
       params.push(opts.cursor);
+    }
+    const [filterFragment, filterParams] = filterClause(
+      opts.filters,
+      params.length,
+    );
+    if (filterFragment) {
+      // fragments reference d.<col>; strip alias for direct documents query;
+      // base offset keeps $n placeholders aligned with params pushed so far
+      conds.push(filterFragment.replace(" AND ", "").replaceAll("d.", ""));
+      params.push(...filterParams);
     }
     const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
     params.push(limit + 1);
@@ -826,6 +846,51 @@ export class PostgresStore implements Store {
     const [row] = await this.sql`SELECT COUNT(*)::int AS n FROM api_keys`;
     return num((row as Row).n);
   }
+  // -- Webhooks ---------------------------------------------------------------
+
+  async listWebhooks(): Promise<WebhookRecord[]> {
+    const rows = await this.sql`SELECT * FROM webhooks ORDER BY id`;
+    return (rows as Row[]).map(rowToWebhook);
+  }
+
+  async getWebhook(id: string): Promise<WebhookRecord | null> {
+    const rows = await this.sql`SELECT * FROM webhooks WHERE id = ${id}`;
+    return rows.length ? rowToWebhook(rows[0] as Row) : null;
+  }
+
+  async putWebhook(w: WebhookRecord): Promise<void> {
+    await this.sql`
+      INSERT INTO webhooks (id, url, events, prefixes, enabled, created_at)
+      VALUES (${w.id}, ${w.url}, ${jsonParam(this.sql, w.events)}, ${jsonParam(this.sql, w.prefixes)}, ${w.enabled}, ${w.created_at})
+      ON CONFLICT (id) DO UPDATE SET url = EXCLUDED.url, events = EXCLUDED.events,
+        prefixes = EXCLUDED.prefixes, enabled = EXCLUDED.enabled`;
+  }
+
+  async deleteWebhook(id: string): Promise<boolean> {
+    const rows = await this
+      .sql`DELETE FROM webhooks WHERE id = ${id} RETURNING id`;
+    return rows.length > 0;
+  }
+
+  async recordWebhookAttempt(id: string, status: string): Promise<void> {
+    await this.sql`
+      UPDATE webhooks SET last_status = ${status}, last_attempt_at = ${new Date().toISOString()}
+      WHERE id = ${id}`;
+  }
+
+  async collectionFingerprint(
+    prefix?: string,
+  ): Promise<{ count: number; maxMtime: number }> {
+    const rows = prefix
+      ? await this
+          .sql`SELECT COUNT(*)::int AS n, COALESCE(MAX(mtime),0)::bigint AS m FROM documents WHERE rel_path LIKE ${prefix + "/%"}`
+      : await this
+          .sql`SELECT COUNT(*)::int AS n, COALESCE(MAX(mtime),0)::bigint AS m FROM documents`;
+    return {
+      count: num((rows[0] as Row).n),
+      maxMtime: num((rows[0] as Row).m),
+    };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -883,6 +948,19 @@ function rowToConnector(row: Row): ConnectorConfig {
     enabled: row.enabled === true,
     created_at: s(row.created_at)!,
     updated_at: s(row.updated_at)!,
+  };
+}
+
+function rowToWebhook(row: Row): WebhookRecord {
+  return {
+    id: s(row.id)!,
+    url: s(row.url)!,
+    events: json<string[]>(row.events, ["change"]),
+    prefixes: json<string[]>(row.prefixes, ["*"]),
+    enabled: row.enabled === true,
+    last_status: s(row.last_status),
+    last_attempt_at: s(row.last_attempt_at),
+    created_at: s(row.created_at)!,
   };
 }
 

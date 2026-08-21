@@ -828,4 +828,385 @@ export function registerTools(server: McpServer): void {
         );
       }),
   );
+
+  server.registerTool(
+    "documents_list",
+    {
+      description:
+        "List documents in the knowledge base with kind, origin, type, tags, status, trust, and staleness metadata.",
+      inputSchema: {
+        kind: z.string().optional(),
+        origin: z.string().optional(),
+        folder: z.string().optional(),
+        type: z.string().optional(),
+        tags: z
+          .string()
+          .optional()
+          .describe("Comma-separated tag filter, e.g. 'a,b'"),
+        status: z.string().optional(),
+        trust: z.enum(["low", "medium", "high"]).optional(),
+        fresh: z.boolean().optional(),
+        project: z.string().optional(),
+        limit: z.number().int().min(1).max(500).optional(),
+        cursor: z.string().optional(),
+      },
+    },
+    async (args) =>
+      run(async () => {
+        const params = new URLSearchParams();
+        for (const key of [
+          "kind",
+          "origin",
+          "folder",
+          "type",
+          "tags",
+          "status",
+          "project",
+          "cursor",
+        ] as const) {
+          const value = args[key];
+          if (value !== undefined) params.set(key, value);
+        }
+        if (args.trust !== undefined) params.set("trust", args.trust);
+        if (args.fresh === true) params.set("fresh", "true");
+        if (args.limit !== undefined) params.set("limit", String(args.limit));
+        const qs = params.toString();
+        const data = (await api(
+          `/v1/documents${qs ? `?${qs}` : ""}`,
+        )) as Record<string, unknown>;
+        const items = Array.isArray(data["items"])
+          ? (data["items"] as Record<string, unknown>[])
+          : [];
+        if (items.length === 0) return "No documents match the given filters.";
+        const lines = items.map((doc) => {
+          const relPath = String(doc["rel_path"] ?? "(unknown)");
+          const kind = doc["kind"] ? String(doc["kind"]) : "?";
+          const title = doc["title"] ? String(doc["title"]) : "";
+          const okfType = doc["okf_type"] ? String(doc["okf_type"]) : "";
+          const tags = Array.isArray(doc["tags"])
+            ? (doc["tags"] as unknown[]).map(String).join(",")
+            : "";
+          const meta =
+            [okfType, tags].filter((part) => part.length > 0).join(", ") || "-";
+          return `${relPath} [${kind}] ${title} (${meta})`;
+        });
+        const nextCursor = data["nextCursor"];
+        if (typeof nextCursor === "string" && nextCursor)
+          lines.push(`(more results; nextCursor: ${nextCursor})`);
+        return lines.join("\n");
+      }),
+  );
+
+  server.registerTool(
+    "download_document",
+    {
+      description:
+        "Fetch a document's content by path as text (page, source, or connector document; truncated to 4000 chars).",
+      inputSchema: {
+        path: z.string().describe("Document path relative to the wiki root"),
+      },
+    },
+    async ({ path }) =>
+      run(async () => {
+        const text = await api(`/v1/documents/${encPath(path)}/content`);
+        const body = typeof text === "string" ? text : JSON.stringify(text);
+        return body.length > 4000
+          ? `${body.slice(0, 4000)}\n…[truncated]`
+          : body;
+      }),
+  );
+
+  server.registerTool(
+    "pages_batch",
+    {
+      description:
+        "Apply a batch of page writes/deletes atomically-preflighted by the API: create, update (with optional frontmatter and If-Match OCC guard), or delete up to 100 pages in one call.",
+      inputSchema: {
+        operations: z
+          .array(
+            z.object({
+              rel_path: z
+                .string()
+                .describe("Page path relative to the wiki root"),
+              content: z
+                .string()
+                .optional()
+                .describe("Markdown body (omit for delete)"),
+              frontmatter: z.record(z.unknown()).optional(),
+              ifMatch: z
+                .string()
+                .optional()
+                .describe(
+                  "Expected hash (If-Match) for optimistic concurrency",
+                ),
+              delete: z.boolean().optional(),
+            }),
+          )
+          .min(1)
+          .max(100)
+          .describe("Batch operations, applied in order"),
+      },
+    },
+    async ({ operations }) =>
+      run(async () => {
+        try {
+          const result = await api("/v1/pages/batch", {
+            method: "POST",
+            body: JSON.stringify({ operations }),
+          });
+          const record = result as Record<string, unknown>;
+          const results = Array.isArray(record["results"])
+            ? (record["results"] as Record<string, unknown>[])
+            : [];
+          const lines = [`batch success=${String(record["success"] ?? true)}`];
+          for (const [index, opResult] of results.entries())
+            lines.push(`#${index + 1} ${JSON.stringify(opResult)}`);
+          return lines.join("\n");
+        } catch (err) {
+          if (err instanceof ApiError && err.status === 409) {
+            return [
+              "Conflict preflight failed (HTTP 409): one or more operations hit a stale If-Match hash.",
+              "",
+              "Conflict payload:",
+              err.body,
+            ].join("\n");
+          }
+          throw err;
+        }
+      }),
+  );
+
+  server.registerTool(
+    "documents_delete",
+    {
+      description:
+        "Delete multiple documents by path; reports per-path results.",
+      inputSchema: {
+        rel_paths: z
+          .array(z.string())
+          .min(1)
+          .describe("Document paths relative to the wiki root"),
+      },
+    },
+    async ({ rel_paths }) =>
+      run(async () => {
+        const result = (await api("/v1/documents/delete", {
+          method: "POST",
+          body: JSON.stringify({ rel_paths }),
+        })) as Record<string, unknown>;
+        const results = Array.isArray(result["results"])
+          ? (result["results"] as Record<string, unknown>[])
+          : [];
+        if (results.length === 0) return JSON.stringify(result, null, 2);
+        return results
+          .map((row) => {
+            const relPath = String(row["rel_path"] ?? "(unknown)");
+            const success = row["success"] === true;
+            const error = row["error"];
+            return success
+              ? `${relPath}: deleted`
+              : `${relPath}: FAILED${error ? ` — ${String(error)}` : ""}`;
+          })
+          .join("\n");
+      }),
+  );
+
+  server.registerTool(
+    "export_bundle",
+    {
+      description:
+        "Export documents as a tar.gz bundle filtered by prefix/kind/origin/since/project. Reports byte size and exported file count; does not dump the archive contents.",
+      inputSchema: {
+        prefix: z.string().optional(),
+        kind: z.string().optional(),
+        origin: z.string().optional(),
+        since: z
+          .string()
+          .optional()
+          .describe("Only include documents modified since this timestamp"),
+        project: z.string().optional(),
+      },
+    },
+    async (args) =>
+      run(async () => {
+        const params = new URLSearchParams();
+        for (const key of [
+          "prefix",
+          "kind",
+          "origin",
+          "since",
+          "project",
+        ] as const) {
+          const value = args[key];
+          if (value !== undefined) params.set(key, value);
+        }
+        const qs = params.toString();
+        const headers = new Headers();
+        if (WIKILLM_API_KEY)
+          headers.set("Authorization", `Bearer ${WIKILLM_API_KEY}`);
+        const res = await fetch(
+          `${WIKILLM_URL}/v1/bundle/export${qs ? `?${qs}` : ""}`,
+          {
+            headers,
+          },
+        );
+        if (!res.ok)
+          throw new ApiError(
+            res.status,
+            res.statusText,
+            (await res.text()).slice(0, 800),
+          );
+        const buffer = await res.arrayBuffer();
+        const files = res.headers.get("X-Exported-Files") ?? "(unknown)";
+        return [
+          `bundle exported: ${buffer.byteLength} bytes`,
+          `X-Exported-Files: ${files}`,
+        ].join("\n");
+      }),
+  );
+
+  server.registerTool(
+    "graph_export",
+    {
+      description:
+        "Export the link graph around a page as DOT (default) or compact JSON neighbor lines.",
+      inputSchema: {
+        path: z.string().describe("Page path to root the graph at"),
+        depth: z.number().int().min(1).optional(),
+        format: z.enum(["json", "dot"]).default("dot").optional(),
+      },
+    },
+    async ({ path, depth, format }) =>
+      run(async () => {
+        const params = new URLSearchParams({ format: format ?? "dot" });
+        if (depth !== undefined) params.set("depth", String(depth));
+        const data = await api(
+          `/v1/graph/${encPath(path)}?${params.toString()}`,
+        );
+        if ((format ?? "dot") === "dot")
+          return typeof data === "string" ? data : JSON.stringify(data);
+        // json: compact neighbor lines
+        const record = data as Record<string, unknown>;
+        const nodes = Array.isArray(record["nodes"]) ? record["nodes"] : [];
+        const edges = Array.isArray(record["edges"]) ? record["edges"] : [];
+        const lines: string[] = [];
+        lines.push(`nodes: ${nodes.length}, edges: ${edges.length}`);
+        for (const edge of edges as Record<string, unknown>[])
+          lines.push(
+            `${JSON.stringify(edge["source"] ?? "")} -> ${JSON.stringify(edge["target"] ?? "")}`,
+          );
+        return lines.join("\n");
+      }),
+  );
+
+  server.registerTool(
+    "webhooks_list",
+    {
+      description: "List registered webhooks (admin).",
+      inputSchema: {},
+    },
+    async () =>
+      run(async () => JSON.stringify(await api("/v1/webhooks"), null, 2)),
+  );
+
+  server.registerTool(
+    "webhook_create",
+    {
+      description:
+        "Create a webhook that fires on knowledge-base change events under the given path prefixes.",
+      inputSchema: {
+        url: z.string().url().describe("Webhook target URL"),
+        prefixes: z
+          .array(z.string())
+          .default(["*"])
+          .optional()
+          .describe("Path prefixes the webhook applies to (default ['*'])"),
+        enabled: z.boolean().default(true).optional(),
+      },
+    },
+    async ({ url, prefixes, enabled }) =>
+      run(async () => {
+        const body: Record<string, unknown> = { url };
+        body["events"] = ["change"];
+        body["prefixes"] = prefixes ?? ["*"];
+        if (enabled !== undefined) body["enabled"] = enabled;
+        return JSON.stringify(
+          await api("/v1/webhooks", {
+            method: "POST",
+            body: JSON.stringify(body),
+          }),
+          null,
+          2,
+        );
+      }),
+  );
+
+  server.registerTool(
+    "webhook_delete",
+    {
+      description: "Delete a webhook by id (admin).",
+      inputSchema: { id: z.string().describe("Webhook id") },
+    },
+    async ({ id }) =>
+      run(async () =>
+        JSON.stringify(
+          await api(`/v1/webhooks/${encodeURIComponent(id)}`, {
+            method: "DELETE",
+          }),
+          null,
+          2,
+        ),
+      ),
+  );
+
+  server.registerTool(
+    "get_page_raw",
+    {
+      description:
+        "Fetch a page's raw markdown body without frontmatter processing (truncated to 6000 chars).",
+      inputSchema: {
+        path: z.string().describe("Page path, e.g. 'concepts/occ.md'"),
+      },
+    },
+    async ({ path }) =>
+      run(async () => {
+        const text = await api(`/v1/pages/${encPath(path)}/raw`);
+        const body = typeof text === "string" ? text : JSON.stringify(text);
+        return body.length > 6000
+          ? `${body.slice(0, 6000)}\n…[truncated]`
+          : body;
+      }),
+  );
+
+  server.registerTool(
+    "read_source_content",
+    {
+      description:
+        "Fetch a source document's original bytes decoded as utf8 text (truncated to 4000 chars).",
+      inputSchema: {
+        path: z.string().describe("Source path within the wiki root"),
+      },
+    },
+    async ({ path }) =>
+      run(async () => {
+        const text = await api(`/v1/sources/${encPath(path)}/content`);
+        const body = typeof text === "string" ? text : JSON.stringify(text);
+        return body.length > 4000
+          ? `${body.slice(0, 4000)}\n…[truncated]`
+          : body;
+      }),
+  );
+
+  server.registerTool(
+    "okf_layout",
+    {
+      description: "Fetch the OKF layout specification served by the API.",
+      inputSchema: {},
+    },
+    async () =>
+      run(async () => {
+        const data = await api("/v1/okf/layout");
+        return JSON.stringify(data, null, 2);
+      }),
+  );
 }

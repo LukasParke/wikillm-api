@@ -3,6 +3,7 @@ import { cleanupTempFiles } from "./fs/atomic.js";
 import { createWatcher } from "./fs/watcher.js";
 import { createApp } from "./app.js";
 import { createBroadcaster } from "./services/broadcaster.js";
+import type { ChangeEvent } from "./types/index.js";
 import {
   createServices,
   startConnectors,
@@ -16,8 +17,22 @@ const services = await createServices(config);
 const indexed = await services.pipeline.reindexAll();
 
 const broadcaster = createBroadcaster();
-services.pipeline.setChangeEmitter((event) => broadcaster.broadcast(event));
-const watcher = createWatcher(config.WIKI_ROOT, services.pipeline, broadcaster);
+const emitChange = (event: ChangeEvent["data"]) => {
+  broadcaster.broadcast({ type: "change", data: event });
+  void services.webhooks.dispatch(event);
+};
+services.pipeline.setChangeEmitter(emitChange);
+const watcherBroadcaster = {
+  broadcast: (event: ChangeEvent) => {
+    broadcaster.broadcast(event);
+    void services.webhooks.dispatch(event.data);
+  },
+};
+const watcher = createWatcher(
+  config.WIKI_ROOT,
+  services.pipeline,
+  watcherBroadcaster,
+);
 await startConnectors(services);
 
 const app = createApp({

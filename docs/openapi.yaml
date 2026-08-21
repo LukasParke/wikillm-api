@@ -46,6 +46,8 @@ tags:
     description: Wiki page CRUD with optimistic concurrency control
   - name: Sources
     description: Immutable raw source documents
+  - name: Documents
+    description: General listing and raw content downloads across pages, sources, and connector docs
   - name: Index
     description: Wiki catalog (index.md)
   - name: Log
@@ -72,6 +74,8 @@ tags:
     description: Named project scoping
   - name: Admin
     description: Reindex and store stats (admin only)
+  - name: Webhooks
+    description: Outbound signed change-notification webhooks (admin only)
   - name: Feedback
     description: Query answer feedback
 
@@ -718,6 +722,234 @@ components:
           type: string
           nullable: true
 
+    DocumentEntry:
+      type: object
+      required:
+        - rel_path
+        - kind
+        - hash
+        - mtime
+      properties:
+        rel_path:
+          type: string
+          example: wiki/entities/OpenAI.md
+        kind:
+          type: string
+          enum:
+            - page
+            - source
+            - doc
+          description: page (wiki markdown), source (raw bytes), doc (connector-managed)
+        origin:
+          type: string
+          nullable: true
+          description: Connector id or actor that produced the document
+        title:
+          type: string
+          nullable: true
+        okf_type:
+          type: string
+          nullable: true
+        tags:
+          type: array
+          items:
+            type: string
+        status:
+          type: string
+          nullable: true
+        stale_after:
+          type: string
+          format: date-time
+          nullable: true
+        trust:
+          type: string
+          nullable: true
+          enum:
+            - unverified
+            - machine-confirmed
+            - human-reviewed
+        hash:
+          type: string
+          description: SHA-256 of the document content
+        mtime:
+          type: number
+          description: File modification time in milliseconds
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+        updated_by:
+          type: string
+          nullable: true
+
+    DocumentList:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/DocumentEntry"
+        nextCursor:
+          type: string
+          nullable: true
+
+    BatchPageOperation:
+      type: object
+      required:
+        - rel_path
+      properties:
+        rel_path:
+          type: string
+        content:
+          type: string
+          description: New markdown body; omit for delete operations
+        frontmatter:
+          type: object
+          description: YAML frontmatter fields merged onto the write
+        ifMatch:
+          type: string
+          nullable: true
+          description: Expected SHA-256 hash; any mismatch aborts the whole batch
+        delete:
+          type: boolean
+          description: Delete the page instead of writing it
+
+    BatchPageInput:
+      type: object
+      required:
+        - operations
+      properties:
+        operations:
+          type: array
+          maxItems: 1000
+          items:
+            $ref: "#/components/schemas/BatchPageOperation"
+
+    BatchOperationResult:
+      type: object
+      required:
+        - rel_path
+        - success
+      properties:
+        rel_path:
+          type: string
+        success:
+          type: boolean
+        error:
+          type: string
+          nullable: true
+        conflict:
+          $ref: "#/components/schemas/Conflict"
+
+    BatchPageResult:
+      type: object
+      required:
+        - success
+        - results
+      properties:
+        success:
+          type: boolean
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/BatchOperationResult"
+
+    DeleteDocumentsInput:
+      type: object
+      required:
+        - rel_paths
+      properties:
+        rel_paths:
+          type: array
+          maxItems: 1000
+          items:
+            type: string
+
+    DeleteDocumentsResult:
+      type: object
+      required:
+        - results
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/BatchOperationResult"
+
+    WebhookInput:
+      type: object
+      required:
+        - url
+      properties:
+        url:
+          type: string
+          format: uri
+        events:
+          type: array
+          default: ["change"]
+          items:
+            type: string
+            enum:
+              - change
+        prefixes:
+          type: array
+          default: ["*"]
+          description: Path prefixes that trigger delivery
+          items:
+            type: string
+        enabled:
+          type: boolean
+          default: true
+
+    Webhook:
+      type: object
+      required:
+        - id
+        - url
+        - events
+        - prefixes
+        - enabled
+      properties:
+        id:
+          type: string
+        url:
+          type: string
+          format: uri
+        events:
+          type: array
+          items:
+            type: string
+            enum:
+              - change
+        prefixes:
+          type: array
+          items:
+            type: string
+        enabled:
+          type: boolean
+        last_status:
+          type: integer
+          nullable: true
+          description: HTTP status of the last delivery attempt
+        last_attempt_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+    WebhookList:
+      type: object
+      required:
+        - webhooks
+      properties:
+        webhooks:
+          type: array
+          items:
+            $ref: "#/components/schemas/Webhook"
+
 paths:
   /health:
     get:
@@ -895,6 +1127,47 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+
+  /v1/pages/batch:
+    post:
+      tags:
+        - Pages
+      summary: Apply many page writes atomically
+      description: |
+        All-or-nothing batch write (max 1000 operations). Every operation is
+        preflight-checked against its ifMatch hash before anything is written;
+        a single conflict aborts the whole batch and nothing is mutated.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BatchPageInput"
+      responses:
+        "200":
+          description: All operations applied
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchPageResult"
+        "409":
+          description: Preflight conflict; nothing was written
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                  - results
+                properties:
+                  error:
+                    type: string
+                    example: conflict
+                  results:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/BatchOperationResult"
+
   /v1/sources:
     get:
       tags:
@@ -1014,6 +1287,239 @@ paths:
                     type: boolean
         "404":
           description: Source not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+
+  /v1/documents:
+    get:
+      tags:
+        - Documents
+      summary: List every indexed document
+      description: |
+        General listing across wiki pages, raw sources, and connector docs. Supports
+        ETag revalidation: send If-None-Match with the previously returned ETag to
+        receive 304 when nothing changed.
+      parameters:
+        - name: kind
+          in: query
+          schema:
+            type: string
+            enum:
+              - page
+              - source
+              - doc
+        - name: origin
+          in: query
+          schema:
+            type: string
+          description: Filter by origin (connector id or actor)
+        - name: folder
+          in: query
+          schema:
+            type: string
+          description: Restrict to a folder prefix
+        - name: type
+          in: query
+          schema:
+            type: string
+          description: Comma-separated OKF type filter
+        - name: tags
+          in: query
+          schema:
+            type: string
+          description: Comma-separated tag filter (all must match)
+        - name: status
+          in: query
+          schema:
+            type: string
+          description: Comma-separated lifecycle status filter
+        - name: trust
+          in: query
+          schema:
+            type: string
+            enum:
+              - unverified
+              - machine-confirmed
+              - human-reviewed
+          description: Minimum derived trust tier
+        - name: fresh
+          in: query
+          schema:
+            type: boolean
+          description: When true, exclude documents past their stale_after date
+        - name: project
+          in: query
+          schema:
+            type: string
+          description: Restrict to a project scope
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 50
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Path to start after for pagination
+      responses:
+        "200":
+          description: Document list
+          headers:
+            ETag:
+              schema:
+                type: string
+              description: Collection fingerprint for If-None-Match revalidation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentList"
+        "304":
+          description: Collection unchanged since the supplied If-None-Match
+
+  /v1/pages/{rel_path}/raw:
+    parameters:
+      - name: rel_path
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Relative path of the page, e.g. wiki/entities/OpenAI.md
+        example: wiki/entities/OpenAI.md
+
+    get:
+      tags:
+        - Pages
+      summary: Read a page's raw markdown
+      description: Returns the page body as text/markdown with an ETag header.
+      responses:
+        "200":
+          description: Raw markdown body
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            text/markdown:
+              schema:
+                type: string
+        "404":
+          description: Page not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/sources/{rel_path}/content:
+    parameters:
+      - name: rel_path
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Relative path of the source, e.g. raw/articles/example.md
+        example: raw/articles/example.md
+
+    get:
+      tags:
+        - Sources
+      summary: Download a source's original bytes
+      description: Streams the stored file with its detected Content-Type and an ETag header.
+      responses:
+        "200":
+          description: Original source bytes
+          headers:
+            Content-Type:
+              schema:
+                type: string
+              description: Detected media type of the stored file
+            ETag:
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: Source not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/documents/{rel_path}/content:
+    parameters:
+      - name: rel_path
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Relative path of any indexed document
+        example: wiki/entities/OpenAI.md
+
+    get:
+      tags:
+        - Documents
+      summary: Download a document's content
+      description: |
+        Dispatches on the indexed kind: pages return text/markdown bodies, sources
+        return their original bytes with the stored Content-Type, and connector docs
+        return the indexed body held in the store. Responses carry an ETag header.
+      responses:
+        "200":
+          description: Document content
+          headers:
+            Content-Type:
+              schema:
+                type: string
+            ETag:
+              schema:
+                type: string
+          content:
+            text/markdown:
+              schema:
+                type: string
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: Document not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/documents/delete:
+    post:
+      tags:
+        - Documents
+      summary: Bulk delete documents
+      description: |
+        Deletes files by relative path and returns one result per operation.
+        Connector-managed docs fail with error "connector_managed" — delete them
+        via their connector instead.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeleteDocumentsInput"
+      responses:
+        "200":
+          description: Per-operation deletion results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteDocumentsResult"
+        "400":
+          description: Validation error
           content:
             application/json:
               schema:
@@ -1329,6 +1835,52 @@ paths:
                     type: string
                     example: llm_not_configured
 
+  /v1/graph:
+    get:
+      tags:
+        - Graph
+      summary: Link graph neighbors (query-param form)
+      description: Equivalent to /v1/graph/{rel_path}; accepts the same parameters.
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Relative path of the page
+        - name: depth
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 3
+            default: 1
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum:
+              - json
+              - dot
+            default: json
+          description: json (default) or dot (text/vnd.graphviz)
+      responses:
+        "200":
+          description: Graph neighborhood
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GraphResponse"
+            text/vnd.graphviz:
+              schema:
+                type: string
+        "404":
+          description: Page not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /v1/graph/{rel_path}:
     parameters:
       - name: rel_path
@@ -1343,7 +1895,7 @@ paths:
       tags:
         - Graph
       summary: Link graph neighbors
-      description: Returns nodes and edges around a page, following wiki links.
+      description: Returns nodes and edges around a page, following wiki links. Accepts format=json (default) or format=dot (text/vnd.graphviz).
       parameters:
         - name: depth
           in: query
@@ -1352,6 +1904,15 @@ paths:
             minimum: 1
             maximum: 3
             default: 1
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum:
+              - json
+              - dot
+            default: json
+          description: json (default) or dot (text/vnd.graphviz)
       responses:
         "200":
           description: Graph neighborhood
@@ -1359,6 +1920,10 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GraphResponse"
+            text/vnd.graphviz:
+              schema:
+                type: string
+              description: DOT output when format=dot
         "404":
           description: Page not found
           content:
@@ -1410,15 +1975,60 @@ paths:
       tags:
         - Bundle
       summary: Export the bundle
-      description: Streams the whole knowledge base as a .tar.gz archive.
+      description: |
+        Streams the knowledge base as a .tar.gz archive. Without filters the whole
+        bundle is exported (X-Exported-Files: all); with filters only matching files
+        are included and X-Exported-Files reports their count. Returns 404 when the
+        filter set matches nothing.
+      parameters:
+        - name: prefix
+          in: query
+          schema:
+            type: string
+          description: Folder prefix filter
+        - name: kind
+          in: query
+          schema:
+            type: string
+            enum:
+              - page
+              - source
+          description: Only include this kind (connector docs have no backing file)
+        - name: origin
+          in: query
+          schema:
+            type: string
+          description: Only files produced by this origin (connector id or actor)
+        - name: since
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: ISO watermark; intersects candidates with the changes ledger
+        - name: project
+          in: query
+          schema:
+            type: string
+          description: Restrict to a project scope
       responses:
         "200":
           description: Bundle tarball
+          headers:
+            X-Exported-Files:
+              schema:
+                type: string
+              description: Number of exported files, or "all" for unfiltered exports
           content:
             application/gzip:
               schema:
                 type: string
                 format: binary
+        "404":
+          description: No files match the export filters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /v1/bundle/import:
     post:
@@ -1644,6 +2254,99 @@ paths:
               schema:
                 type: object
                 description: Overview stats of the index store
+
+
+  /v1/webhooks:
+    get:
+      tags:
+        - Webhooks
+      summary: List outbound webhooks
+      description: Requires admin role.
+      responses:
+        "200":
+          description: Registered webhooks
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookList"
+        "403":
+          description: Admin role required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+    post:
+      tags:
+        - Webhooks
+      summary: Register an outbound webhook
+      description: |
+        Deliveries are HMAC-SHA256 signed (X-WikiLLM-Signature header) using the
+        webhook_secret runtime setting and retried at 250ms, 1s, and 4s. Each
+        webhook tracks last_status and last_attempt_at.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookInput"
+      responses:
+        "201":
+          description: Webhook created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Webhook"
+        "400":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Admin role required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/webhooks/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Webhook id
+
+    delete:
+      tags:
+        - Webhooks
+      summary: Delete a webhook
+      responses:
+        "200":
+          description: Webhook deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - success
+                properties:
+                  success:
+                    type: boolean
+        "403":
+          description: Admin role required
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Unknown webhook
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /v1/feedback:
     post:

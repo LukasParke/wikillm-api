@@ -14,6 +14,7 @@ import { GraphService } from "./graphService.js";
 import { OkfService } from "./okfService.js";
 import { createProjectService } from "./projectService.js";
 import { ConnectorManager } from "../connectors/manager.js";
+import { WebhookDispatcher } from "./webhookDispatcher.js";
 import { SettingsService } from "./settingsService.js";
 import { KeyRegistry } from "./keyRegistry.js";
 
@@ -49,6 +50,7 @@ export interface Services {
   okf: OkfService;
   projects: ReturnType<typeof createProjectService>;
   connectors: ConnectorManager;
+  webhooks: WebhookDispatcher;
 }
 
 export async function createServices(
@@ -101,6 +103,10 @@ export async function createServices(
   const okf = new OkfService(config, settings);
   const projects = createProjectService(store);
   const connectors = new ConnectorManager(store, pipeline);
+  const webhooks = new WebhookDispatcher(store, settings);
+  // Default emitter so API-only usage (tests, embedded) still dispatches
+  // webhooks; entrypoints override this to also drive SSE/WS broadcasts.
+  pipeline.setChangeEmitter((event) => void webhooks.dispatch(event));
 
   settings.onChange((key, value) => {
     if (
@@ -142,6 +148,7 @@ export async function createServices(
     okf,
     projects,
     connectors,
+    webhooks,
   };
 }
 

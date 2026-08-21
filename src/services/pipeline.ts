@@ -43,7 +43,7 @@ export class IndexPipeline {
   private embedQueue: string[] = [];
   private queued = new Set<string>();
   private draining = false;
-  private changeEmitter: ((event: ChangeEvent) => void) | null = null;
+  private changeEmitter: ((event: ChangeEvent["data"]) => void) | null = null;
 
   constructor(
     wikiRoot: string,
@@ -54,9 +54,7 @@ export class IndexPipeline {
     this.wikiRoot = wikiRoot;
   }
 
-  /** Wire live broadcasting for API-attributed changes (external ones flow
-   * through the watcher to avoid double emission). */
-  setChangeEmitter(emit: (event: ChangeEvent) => void): void {
+  setChangeEmitter(emit: (event: ChangeEvent["data"]) => void): void {
     this.changeEmitter = emit;
   }
 
@@ -365,7 +363,7 @@ export class IndexPipeline {
     };
     void this.store.insertChange(change);
     if (attribution.source === "api" && this.changeEmitter) {
-      this.changeEmitter({ type: "change", data: change });
+      this.changeEmitter(change);
     }
     return change;
   }

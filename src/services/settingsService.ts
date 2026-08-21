@@ -139,6 +139,21 @@ const SETTING_META: SettingMeta[] = [
     validate: z.string(),
   },
   {
+    key: "max_upload_mb",
+    type: "int",
+    mutable: true,
+    description: "Maximum accepted upload body size in megabytes",
+    validate: z.number().int().min(1).max(4096),
+  },
+  {
+    key: "webhook_secret",
+    type: "secret",
+    mutable: true,
+    description:
+      "HMAC-SHA256 secret used to sign outbound webhook deliveries (write-only)",
+    validate: z.union([z.string(), z.null()]),
+  },
+  {
     key: "layout",
     type: "enum",
     mutable: true,
@@ -259,6 +274,10 @@ export class SettingsService {
         return this.config.OKF_STRICT;
       case "human_actors":
         return this.config.HUMAN_ACTORS ?? "";
+      case "max_upload_mb":
+        return 100;
+      case "webhook_secret":
+        return "";
       case "layout":
         return this.config.LAYOUT;
       default:

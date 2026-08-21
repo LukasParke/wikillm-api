@@ -20,6 +20,8 @@ import wsRoute from "./routes/ws.js";
 import rootRoute from "./routes/root.js";
 import settingsRoute from "./routes/settings.js";
 import keysRoute from "./routes/keys.js";
+import documentsRoute from "./routes/documents.js";
+import webhooksRoute from "./routes/webhooks.js";
 import queryRoute from "./routes/query.js";
 import graphRoute from "./routes/graph.js";
 import okfRoute from "./routes/okf.js";
@@ -96,6 +98,8 @@ export function createApp({
   app.route("/v1", rootRoute);
   app.route("/v1/settings", settingsRoute);
   app.route("/v1/keys", keysRoute);
+  app.route("/v1/documents", documentsRoute);
+  app.route("/v1/webhooks", webhooksRoute);
   app.route("/v1/pages", pages);
   app.route("/v1/sources", sources);
   app.route("/v1/index", indexRoute);

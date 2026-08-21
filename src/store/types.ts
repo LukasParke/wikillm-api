@@ -178,6 +178,19 @@ export interface FeedbackInput {
   comment?: string | null;
 }
 
+export interface WebhookRecord {
+  id: string;
+  url: string;
+  /** event names; currently only "change" */
+  events: string[];
+  /** rel_path prefixes; ["*"] = all */
+  prefixes: string[];
+  enabled: boolean;
+  last_status: string | null;
+  last_attempt_at: string | null;
+  created_at: string;
+}
+
 export interface StatsOverview {
   documents: number;
   chunks: number;
@@ -240,6 +253,8 @@ export interface ListOptions {
   origin?: string;
   limit?: number;
   cursor?: string;
+  /** full filter matrix shared with retrieval (trust, tags, status, ...) */
+  filters?: SearchFilters;
 }
 
 export interface Page<T> {
@@ -329,6 +344,18 @@ export interface Store {
   /** Drop all embedding vectors, clear embedded flags, and on Postgres
    * resize the vector column to the new dimensions. */
   resetEmbeddings(dims?: number): Promise<void>;
+
+  // Webhooks (outbound change notifications)
+  listWebhooks(): Promise<WebhookRecord[]>;
+  getWebhook(id: string): Promise<WebhookRecord | null>;
+  putWebhook(w: WebhookRecord): Promise<void>;
+  deleteWebhook(id: string): Promise<boolean>;
+  recordWebhookAttempt(id: string, status: string): Promise<void>;
+
+  /** Collection fingerprint for list ETags. */
+  collectionFingerprint(
+    prefix?: string,
+  ): Promise<{ count: number; maxMtime: number }>;
 
   // Runtime settings (key/value overrides persisted across restarts)
   getSettings(): Promise<SettingsMap>;

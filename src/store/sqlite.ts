@@ -3,13 +3,14 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ulid } from "ulidx";
-import { ftsQuery } from "./fts.js";
 import type { ChangeEvent, Operation } from "../types/index.js";
+import { ftsQuery } from "./fts.js";
 import {
   TRUST_ORDER,
   type ApiKeyRecord,
   type ApiKeyUpsert,
   type SettingsMap,
+  type WebhookRecord,
   type ChunkHit,
   type ChunkInput,
   type ChunkRecord,
@@ -312,26 +313,33 @@ export class SqliteStore implements Store {
   }
 
   listDocuments(opts: ListOptions): Promise<Page<DocumentRecord>> {
-    const folder = opts.folder ?? "";
     const limit = opts.limit ?? 50;
-    let sql = "SELECT * FROM documents WHERE 1=1";
+    const conds: string[] = [];
     const params: SqlParam[] = [];
-    if (folder) {
-      sql += " AND rel_path LIKE ?";
-      params.push(`${folder}/%`);
+    if (opts.folder) {
+      conds.push("(rel_path LIKE ? OR rel_path LIKE ?)");
+      params.push(`${opts.folder}/%`, `${opts.folder}/%/%`);
     }
     if (opts.kind) {
-      sql += " AND kind = ?";
+      conds.push("kind = ?");
       params.push(opts.kind);
     }
     if (opts.origin) {
-      sql += " AND origin = ?";
+      conds.push("origin = ?");
       params.push(opts.origin);
     }
     if (opts.cursor) {
-      sql += " AND rel_path > ?";
+      conds.push("rel_path > ?");
       params.push(opts.cursor);
     }
+    const [filterFragment, filterParams] = filterClause(opts.filters);
+    if (filterFragment) {
+      // fragment appended last so its ?-placeholders match appended params
+      conds.push(filterFragment.replace(" AND ", "").replaceAll("d.", ""));
+      params.push(...(filterParams as SqlParam[]));
+    }
+    let sql = "SELECT * FROM documents";
+    if (conds.length) sql += " WHERE " + conds.join(" AND ");
     sql += " ORDER BY rel_path LIMIT ?";
     params.push(limit + 1);
     const rows = this.db.prepare(sql).all(...params) as unknown[];
@@ -877,6 +885,73 @@ export class SqliteStore implements Store {
       num(asRow(this.db.prepare("SELECT COUNT(*) AS n FROM api_keys").get()).n),
     );
   }
+  // -- Webhooks ---------------------------------------------------------------
+
+  listWebhooks(): Promise<WebhookRecord[]> {
+    const rows = this.db
+      .prepare("SELECT * FROM webhooks ORDER BY id")
+      .all() as unknown[];
+    return Promise.resolve(rows.map((r) => rowToWebhook(asRow(r))));
+  }
+
+  getWebhook(id: string): Promise<WebhookRecord | null> {
+    const row = this.db.prepare("SELECT * FROM webhooks WHERE id = ?").get(id);
+    return Promise.resolve(row ? rowToWebhook(asRow(row)) : null);
+  }
+
+  putWebhook(w: WebhookRecord): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO webhooks (id, url, events, prefixes, enabled, created_at)
+         VALUES (?,?,?,?,?,?)
+         ON CONFLICT(id) DO UPDATE SET url=excluded.url, events=excluded.events,
+           prefixes=excluded.prefixes, enabled=excluded.enabled`,
+      )
+      .run(
+        w.id,
+        w.url,
+        jstr(w.events)!,
+        jstr(w.prefixes)!,
+        w.enabled ? 1 : 0,
+        w.created_at,
+      );
+    return Promise.resolve();
+  }
+
+  deleteWebhook(id: string): Promise<boolean> {
+    const res = this.db.prepare("DELETE FROM webhooks WHERE id = ?").run(id);
+    return Promise.resolve(res.changes > 0);
+  }
+
+  recordWebhookAttempt(id: string, status: string): Promise<void> {
+    this.db
+      .prepare(
+        "UPDATE webhooks SET last_status = ?, last_attempt_at = ? WHERE id = ?",
+      )
+      .run(status, new Date().toISOString(), id);
+    return Promise.resolve();
+  }
+
+  collectionFingerprint(
+    prefix?: string,
+  ): Promise<{ count: number; maxMtime: number }> {
+    const row = prefix
+      ? asRow(
+          this.db
+            .prepare(
+              "SELECT COUNT(*) AS n, COALESCE(MAX(mtime),0) AS m FROM documents WHERE rel_path LIKE ? OR rel_path LIKE ?",
+            )
+            .get(`${prefix}/%`, `${prefix}/%/%`),
+        )
+      : asRow(
+          this.db
+            .prepare(
+              "SELECT COUNT(*) AS n, COALESCE(MAX(mtime),0) AS m FROM documents",
+            )
+            .get(),
+        );
+    return Promise.resolve({ count: num(row.n), maxMtime: num(row.m) });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -934,6 +1009,19 @@ function rowToConnector(row: Row): ConnectorConfig {
     enabled: bool(row.enabled),
     created_at: s(row.created_at)!,
     updated_at: s(row.updated_at)!,
+  };
+}
+
+function rowToWebhook(row: Row): WebhookRecord {
+  return {
+    id: s(row.id)!,
+    url: s(row.url)!,
+    events: json<string[]>(row.events, ["change"]),
+    prefixes: json<string[]>(row.prefixes, ["*"]),
+    enabled: bool(row.enabled),
+    last_status: s(row.last_status),
+    last_attempt_at: s(row.last_attempt_at),
+    created_at: s(row.created_at)!,
   };
 }
 

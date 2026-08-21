@@ -25,6 +25,10 @@ hybrid retrieval.
 - **Atomic writes + optimistic concurrency** — temp-file + rename; every resource has a SHA-256 `etag`/hash; stale writes return `409 Conflict`.
 - **Multi-source attribution** — every API key maps to an OKF actor (`human:<name>` for people, `<name>/wikillm-api` for agents).
 - **Live updates** — both Server-Sent Events and WebSocket feeds broadcast filesystem changes, including external edits from Obsidian/git.
+- **General document listing + raw downloads** — `GET /v1/documents` spans pages, sources, and connector docs with shared filters and ETag revalidation (304); `/content` endpoints download raw content, dispatched by kind.
+- **Batch writes** — `POST /v1/pages/batch` applies up to 1000 writes/deletes atomically behind an all-or-nothing OCC preflight.
+- **Outbound webhooks (signed)** — admin-registered HTTP endpoints receive HMAC-SHA256-signed change deliveries with retries.
+- **Local ONNX embeddings** — semantic search with zero external services via an in-process transformers.js embedder (see [ONNX embeddings (local)](#onnx-embeddings-local)).
 - **Projects & RBAC** — named project scopes with per-key `read`/`write`/`admin` roles.
 - **MCP server** — LLM-free retrieval tools for agents over stdio or Streamable HTTP.
 - **Analytics** — Prometheus `/metrics`, query analytics, and a feedback loop.
@@ -117,6 +121,12 @@ All routes are under `/v1` unless noted.
 | GET | `/v1/sources/:rel_path` | Read source metadata |
 | POST | `/v1/sources/:rel_path` | Upload a source (write-once unless `?force=true`) |
 | DELETE | `/v1/sources/:rel_path` | Delete a source |
+| GET | `/v1/documents` | List every indexed document (pages, sources, connector docs) with filters + ETag revalidation |
+| GET | `/v1/documents/:rel_path/content` | Download any document's content (dispatches by kind) |
+| GET | `/v1/pages/:rel_path/raw` | Read a page's raw markdown (ETag) |
+| GET | `/v1/sources/:rel_path/content` | Download a source's original bytes (`Content-Type` + ETag) |
+| POST | `/v1/pages/batch` | Atomic multi-page writes/deletes (all-or-nothing OCC preflight, max 1000) |
+| POST | `/v1/documents/delete` | Bulk delete with per-op results (connector-managed docs return `connector_managed`) |
 | GET | `/v1/index` | Read `index.md` + structured catalog |
 | POST | `/v1/index/refresh` | Regenerate `index.md` |
 | GET | `/v1/log` | Read `log.md` |
@@ -127,15 +137,17 @@ All routes are under `/v1` unless noted.
 | GET | `/v1/events` | SSE live change stream |
 | GET | `/v1/ws` | WebSocket live change stream |
 | POST | `/v1/ingest` | Batch ingestion |
-| GET | `/v1/graph/:rel_path` | Link graph neighbors (depth 1–3) |
+| GET | `/v1/graph/:rel_path` | Link graph neighbors (depth 1–3); `format=dot` returns Graphviz (`text/vnd.graphviz`) |
 | POST | `/v1/okf/validate` | Validate bundle or single document |
 | GET | `/v1/okf/layout` | Active layout profile |
-| GET | `/v1/bundle/export` | Export bundle as `.tar.gz` |
+| GET | `/v1/bundle/export` | Export bundle as `.tar.gz`; filters `prefix`/`kind`/`origin`/`since`/`project`, header `X-Exported-Files`, 404 when nothing matches |
 | POST | `/v1/bundle/import` | Import bundle (admin; `?force=` to overwrite) |
 | GET/POST/DELETE | `/v1/connectors` | Manage connectors (`git`, `web`, `github`) (admin) |
 | POST | `/v1/connectors/:id/run` | Run a connector now (admin) |
 | GET | `/v1/projects` | List projects |
 | PUT/DELETE | `/v1/projects/:name` | Manage projects (admin) |
+| GET/POST | `/v1/webhooks` | List / register outbound webhooks (admin) |
+| DELETE | `/v1/webhooks/:id` | Delete a webhook (admin) |
 | POST | `/v1/admin/reindex` | Rebuild the index from the filesystem (admin) |
 | GET | `/v1/admin/stats` | Store overview stats (admin) |
 | POST | `/v1/feedback` | Rate a query answer (`query_id`, `helpful`, `comment?`) |
@@ -157,7 +169,9 @@ curl -X PUT http://localhost:3000/v1/settings/rate_limit_rpm \
 
 Hot-appliable keys include: `public_read`, `rate_limit_rpm`, `connector_poll_seconds`,
 `llm_base_url`, `llm_api_key` (secret — write-only, masked in listings), `llm_model`,
-`llm_embed_model`, `embedding_dims`, `llm_distill`, `okf_strict`, `human_actors`, `layout`.
+`llm_embed_model`, `embedding_dims`, `llm_distill`, `okf_strict`, `human_actors`, `layout`,
+`embedding_provider` (`none`/`api`/`onnx`/`auto`), `onnx_model`, `onnx_dtype`
+(`q8`/`fp16`/`fp32`), `onnx_device`, `max_upload_mb`, and `webhook_secret` (secret — masked).
 
 **Secrets are masked** in `GET /v1/settings` responses.
 
@@ -179,6 +193,28 @@ WikiLLM bootstrap admin key ... shown once
 ```
 
 Set `BOOTSTRAP_ADMIN_KEY` to pin that secret instead of a random one.
+
+#### ONNX embeddings (local)
+
+Semantic search works with **zero external services**: an in-process transformers.js
+embedder (default `Xenova/bge-small-en-v1.5`, q8, 384 dims) runs inside the API. Switch
+it on at runtime — no restart, no API key:
+
+```bash
+curl -X PUT http://localhost:3000/v1/settings/embedding_dims \
+  -H "Authorization: Bearer <admin-key>" \
+  -H "Content-Type: application/json" -d '{"value": 384}'
+curl -X PUT http://localhost:3000/v1/settings/embedding_provider \
+  -H "Authorization: Bearer <admin-key>" \
+  -H "Content-Type: application/json" -d '{"value": "onnx"}'
+curl -X POST http://localhost:3000/v1/admin/reindex \
+  -H "Authorization: Bearer <admin-key>"
+```
+
+`embedding_provider` accepts `none`, `api` (OpenAI-compatible endpoint), `onnx`, or
+`auto`. Model, quantization, and device are tunable via `onnx_model`, `onnx_dtype`
+(`q8`/`fp16`/`fp32`), and `onnx_device`; on Strix Halo / Ryzen AI hardware, pass an
+ONNX execution-provider string through `onnx_device` to target the NPU.
 
 ## Post-deploy setup entirely via API/MCP
 

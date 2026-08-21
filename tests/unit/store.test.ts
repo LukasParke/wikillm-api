@@ -208,6 +208,83 @@ describe.each(backends)("store backend: %s", (name, factory) => {
     expect(after.feedback_helpful).toBe(before.feedback_helpful + 1);
   });
 
+  it("lists documents with the full filter matrix", async () => {
+    await store.upsertDocument(
+      sampleDoc({
+        rel_path: "wiki/list/alpha.md",
+        okf_type: "Concept",
+        tags: ["list-a"],
+        status: "stable",
+      }),
+    );
+    await store.upsertDocument(
+      sampleDoc({
+        rel_path: "raw/list/beta.txt",
+        kind: "source",
+        origin: "web-x",
+        okf_type: null,
+        tags: ["list-b"],
+        status: "draft",
+      }),
+    );
+
+    const byKind = await store.listDocuments({ kind: "source" });
+    expect(byKind.items.every((d) => d.kind === "source")).toBe(true);
+
+    const byOrigin = await store.listDocuments({ origin: "web-x" });
+    expect(byOrigin.items.map((d) => d.rel_path)).toContain(
+      "raw/list/beta.txt",
+    );
+
+    const typed = await store.listDocuments({
+      filters: { okf_types: ["Concept"] },
+    });
+    expect(typed.items.map((d) => d.rel_path)).toContain("wiki/list/alpha.md");
+    expect(typed.items.map((d) => d.rel_path)).not.toContain(
+      "raw/list/beta.txt",
+    );
+
+    const tagged = await store.listDocuments({
+      filters: { tags: ["list-b"] },
+    });
+    expect(tagged.items.map((d) => d.rel_path)).toEqual(["raw/list/beta.txt"]);
+
+    const statuses = await store.listDocuments({
+      filters: { statuses: ["draft"] },
+    });
+    const draftPaths = statuses.items.map((d) => d.rel_path);
+    expect(draftPaths).toContain("raw/list/beta.txt");
+    expect(draftPaths).not.toContain("wiki/list/alpha.md"); // stable
+  });
+
+  it("computes collection fingerprints for ETags", async () => {
+    const before = await store.collectionFingerprint();
+    await store.upsertDocument(sampleDoc({ rel_path: "wiki/fp/one.md" }));
+    const after = await store.collectionFingerprint("wiki/fp");
+    expect(after.count).toBe(1);
+    expect(after.maxMtime).toBeGreaterThan(0);
+    void before;
+  });
+
+  it("stores webhook subscriptions", async () => {
+    await store.putWebhook({
+      id: "wh-1",
+      url: "https://example.com/hook",
+      events: ["change"],
+      prefixes: ["wiki/"],
+      enabled: true,
+      last_status: null,
+      last_attempt_at: null,
+      created_at: new Date().toISOString(),
+    });
+    const hook = await store.getWebhook("wh-1");
+    expect(hook?.prefixes).toEqual(["wiki/"]);
+    await store.recordWebhookAttempt("wh-1", "200");
+    expect((await store.getWebhook("wh-1"))?.last_status).toBe("200");
+    expect(await store.listWebhooks()).toHaveLength(1);
+    expect(await store.deleteWebhook("wh-1")).toBe(true);
+  });
+
   it("supports vector search where the backend can", async () => {
     if (!store.supportsVector()) return; // SQLite is FTS-only by design
     await store.upsertDocument(sampleDoc({ rel_path: "wiki/vec/target.md" }));

@@ -164,3 +164,14 @@ CREATE TABLE IF NOT EXISTS api_keys (
   updated_at TEXT NOT NULL,
   created_by TEXT
 );
+
+CREATE TABLE IF NOT EXISTS webhooks (
+  id TEXT PRIMARY KEY,
+  url TEXT NOT NULL,
+  events TEXT NOT NULL DEFAULT '["change"]',
+  prefixes TEXT NOT NULL DEFAULT '["*"]',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  last_status TEXT,
+  last_attempt_at TEXT,
+  created_at TEXT NOT NULL
+);
