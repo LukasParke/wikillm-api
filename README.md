@@ -14,6 +14,36 @@ pattern with [Google OKF v0.2](https://github.com/GoogleCloudPlatform/knowledge-
 bundle conformance and [Cerebras-pattern](https://www.cerebras.ai/blog/how-we-built-our-knowledge-base)
 hybrid retrieval.
 
+## Two implementations
+
+This repository contains two functionally equivalent implementations:
+
+| | TypeScript (`src/`) | Rust (`rust/`) |
+|---|---|---|
+| Runtime | Bun 1.3+ / Node 20+ | Rust 1.97+ (tokio) |
+| HTTP framework | Hono | axum 0.8 |
+| SQLite driver | bun:sqlite / better-sqlite3 | rusqlite (bundled FTS5) |
+| Postgres driver | postgres.js / tokio-postgres | tokio-postgres |
+| MCP transport | @modelcontextprotocol/sdk (stdio + HTTP) | hand-rolled JSON-RPC over stdio |
+| ONNX embeddings | transformers.js (optional dep) | feature-gated stub |
+| Tests | vitest (138 tests) | cargo test (76 tests) |
+
+Both serve the same REST API, read/write the same wiki folder format, and can
+be used interchangeably. The TypeScript version is the original and has more
+battle-tested edge cases; the Rust version offers lower memory footprint and
+single-binary deployment.
+
+### Running the Rust version
+
+```bash
+cd rust
+cargo build --release
+WIKI_ROOT=/path/to/wiki API_KEYS="admin:secret:*:admin" ./target/release/wikillm-api
+```
+
+See [`rust/README.md`](rust/README.md) for full details.
+
+
 ## Features
 
 - **Filesystem as source of truth** — the wiki folder *is* an OKF bundle; Obsidian and git coexist. The Postgres + pgvector index is a derived cache, with an embedded SQLite fallback (full-text retrieval only).
