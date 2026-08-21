@@ -1,107 +1,83 @@
 # WikiLLM API Benchmark Results
 
-Run on the local development machine using [autocannon](https://github.com/mcollina/autocannon) via `scripts/benchmark.sh`.
+## 2026-08-21 run (post agent-control/runtime-config milestone)
 
-## Test environment
+Environment: CachyOS (Linux 7.1.5), AMD Ryzen 9 7950X3D (32 threads), 62 GiB RAM,
+Bun 1.3.14. Wiki seeded on tmpfs (`/tmp`). No LLM/embedder configured → retrieval
+runs in **FTS mode**; vector/HNSW path requires an embedder and is not measured here.
 
-- **OS:** Linux 7.0.11-arch1-1 x86_64
-- **CPU:** AMD Ryzen 9 7950X3D 16-Core Processor (32 logical cores)
-- **Memory:** 62 GiB
-- **Runtime:** Bun 1.3.13
-- **Date:** 2026-06-22
+Methodology fixes this round: the previous "unique page creation" and "mixed
+workload" autocannon scenarios silently sent malformed requests (`-i` files are
+request *bodies* in autocannon, not request scripts) — their old numbers were
+invalid and have been replaced. Unique-page creation now uses autocannon
+`--idReplacement`; mixed read/write workloads are covered exclusively by the
+realistic client script. Source uploads use `?force=true` to measure sustained
+overwrite instead of one-shot 409s.
 
-## Results summary
+### Synthetic peak throughput (SQLite backend)
 
-| Endpoint                             | Concurrency |     Throughput | Avg latency | p99 latency |
-| ------------------------------------ | ----------: | -------------: | ----------: | ----------: |
-| `GET /health`                        |          10 | ~104,000 req/s |     0.01 ms |        0 ms |
-| `GET /health`                        |          50 | ~102,000 req/s |     0.03 ms |        1 ms |
-| `GET /health`                        |         100 |  ~98,000 req/s |     0.42 ms |        1 ms |
-| `GET /health`                        |         200 |  ~95,000 req/s |     1.48 ms |        4 ms |
-| `GET /v1/pages/wiki/...`             |          10 |  ~44,000 req/s |     0.02 ms |        0 ms |
-| `GET /v1/pages/wiki/...`             |          50 |  ~44,000 req/s |     0.68 ms |        2 ms |
-| `GET /v1/pages/wiki/...`             |         100 |  ~45,000 req/s |     1.77 ms |       11 ms |
-| `PUT /v1/pages/wiki/...` (same page) |           1 |   ~4,600 req/s |     0.01 ms |        0 ms |
-| `PUT /v1/pages/wiki/...` (same page) |           5 |   ~5,100 req/s |     0.20 ms |        2 ms |
-| `PUT /v1/pages/wiki/...` (same page) |          10 |   ~4,900 req/s |     1.37 ms |        3 ms |
-| `POST /v1/ingest`                    |           1 |     ~800 req/s |     0.09 ms |        2 ms |
-| `PUT /v1/pages/wiki/{unique}.md`     |           1 |     ~929 req/s |           — |           — |
+| Scenario | Concurrency | Throughput | Notes |
+| --- | ---: | ---: | --- |
+| `GET /health` | 200 | ~69,000 req/s | |
+| `GET /v1/pages/:path` | 50 | ~33,000 req/s | FS read + hash |
+| `GET /v1/pages?folder=&limit=50` | 50 | ~4,000 req/s | 100-entity folder |
+| `GET /v1/search?q=` (FTS) | 10 | ~2,000–2,300 req/s | FTS5 bm25 over chunks |
+| `PUT /v1/pages/:path` (same page) | 10 | ~3,400 req/s | per-path lock ceiling |
+| `PUT` unique page creation | 5 | ~2,800 req/s | chunk + edges + ledgers per write |
+| `POST /v1/sources/:path?force=true` | 5 | ~4,100 req/s | |
+| `POST /v1/log/append` | 1 | ~400 req/s | whole-file rewrite grows with log size |
+| `POST /v1/index/refresh` | 1 | ~600 req/s | regenerates + re-chunks `index.md` |
+| `GET /v1/changes?limit=100` | 10 | ~5,500 req/s | |
+| `GET /v1/changes?path=<hot>` | 10 | ~59 req/s | sort over ~90k rows for one hot path |
+| `POST /v1/ingest` (source + 2 pages + log + index) | 1 | ~90 ops/s | |
 
-## Realistic workload benchmarks
+All scenarios returned 2xx throughout.
 
-`scripts/benchmark-realistic.ts` seeds a 100-page, 20-source wiki and runs
-probabilistic clients with think times to mimic real traffic patterns.
+### Realistic mixed workloads (SQLite backend)
 
-| Scenario                                                  | Clients | Think time |   Throughput | p99 latency |
-| --------------------------------------------------------- | ------: | ---------: | -----------: | ----------: |
-| Read-heavy browsing (health + pages + search)             |     100 |      50 ms | ~3,700 req/s |       16 ms |
-| Mixed read/write (70% reads / 30% writes)                 |      50 |     100 ms |   ~970 req/s |        8 ms |
-| Write-heavy editing (updates + new notes + sources + log) |      25 |      50 ms |   ~190 req/s |        1 ms |
-| Batch ingestion (source + 2 pages + log + index refresh)  |       3 |     200 ms |    ~19 ops/s |       42 ms |
-| Observer polling changes/index refresh                    |      10 |     500 ms |     ~7 req/s |    2,750 ms |
+Seeded 100-page/20-source wiki; probabilistic clients with think times.
 
-## Raw autocannon output
+| Scenario | Clients | Think | Throughput | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Read-heavy browsing | 100 | 50 ms | ~3,900 req/s | 0.15 ms | 2.0 ms | 8.1 ms |
+| Mixed read/write | 50 | 100 ms | ~977 req/s | 0.77 ms | 4.2 ms | 7.5 ms |
+| Write-heavy editing | 25 | 50 ms | ~592–623 req/s | 15 ms | 36 ms | 43–53 ms |
+| Batch ingestion | 3 | 200 ms | ~17 ops/s | 69 ms | 160 ms | 213 ms |
+| Observer polling | 10 | 500 ms | ~36 req/s | 7.2 ms | 102 ms | 171 ms |
 
-```
-GET /health | concurrency=10
-  1,144k requests in 11s, 222 MB read
-  ~104k req/s, latency p50 0 ms, p99 0 ms
+Zero errors across all realistic scenarios.
 
-GET /health | concurrency=50
-  1,127k requests in 11.01s, 219 MB read
-  ~102k req/s, latency p50 0 ms, p99 1 ms
+### Postgres + pgvector backend comparison (focused set, 101-page corpus)
 
-GET /health | concurrency=100
-  1,079k requests in 11.01s, 209 MB read
-  ~98k req/s, latency p50 0 ms, p99 1 ms
+| Scenario | SQLite | Postgres | Delta |
+| --- | ---: | ---: | --- |
+| `GET /v1/pages/:path` | ~32,800 req/s | ~30,600 req/s | parity |
+| `GET /v1/search?q=` (FTS) | ~2,100 req/s | ~554 req/s (p99 55 ms) | pg ts_rank scoring path needs optimization |
+| `GET /v1/changes?limit=100` | ~5,500 req/s | ~3,300 req/s | parity-ish |
+| `PUT` contended (c=5) | ~3,200 req/s | ~131 req/s (p99 59 ms) | multi-round-trip ledger writes; batch into one transaction |
 
-GET /health | concurrency=200
-  1,046k requests in 11.02s, 203 MB read
-  ~95k req/s, latency p50 1 ms, p99 4 ms
+Takeaways:
 
-GET /v1/pages/wiki/bench.md | concurrency=10
-  480k requests in 11s, 251 MB read
-  ~44k req/s, latency p50 0 ms, p99 0 ms
+1. Read paths are backend-parity; the store abstraction costs nothing measurable.
+2. The Postgres write path pays ~4-6 sequential round trips per mutation
+   (operation, document upsert, chunks transaction, change). Consolidating these
+   into a single transaction is the top write-path optimization.
+3. Postgres full-text ranking computes `ts_rank` for every match before LIMIT;
+   a sub-select rank-then-limit or `ts_rank_cd` tuning is the follow-up.
+4. Two known hot-spot degradations on SQLite at high row counts:
+   `GET /v1/changes?path=` sorts all rows for that path (add composite
+   `(rel_path, detected_at)` index), and `log/append` rewrites the whole
+   `log.md`, so throughput falls as the log grows.
 
-GET /v1/pages/wiki/bench.md | concurrency=50
-  481k requests in 11.01s, 251 MB read
-  ~44k req/s, latency p50 1 ms, p99 2 ms
+## Historical run (2026-06-22, pre-roadmap implementation)
 
-GET /v1/pages/wiki/bench.md | concurrency=100
-  493k requests in 11.01s, 257 MB read
-  ~45k req/s, latency p50 2 ms, p99 11 ms
+Environment: Arch Linux, same CPU/memory, Bun 1.3.13. Kept for trend reference;
+the unique-creation and (absent) mixed rows from this run were invalidated by the
+methodology issue described above.
 
-PUT /v1/pages/wiki/bench.md (same page) | concurrency=1
-  50k requests in 11s, 29 MB read
-  ~4.6k req/s, latency p50 0 ms, p99 0 ms
-
-PUT /v1/pages/wiki/bench.md (same page) | concurrency=5
-  56k requests in 11s, 32.2 MB read
-  ~5.1k req/s, latency p50 0 ms, p99 2 ms
-
-PUT /v1/pages/wiki/bench.md (same page) | concurrency=10
-  54k requests in 11s, 31.3 MB read
-  ~4.9k req/s, latency p50 1 ms, p99 3 ms
-
-POST /v1/ingest | concurrency=1
-  8k requests in 10.01s, 2.26 MB read
-  ~800 req/s
-```
-
-## Observations
-
-- Read-heavy endpoints (`/health`, `GET /v1/pages/...`) scale to tens of thousands of
-  requests per second under synthetic load.
-- Realistic browsing with think times yields ~3,700 req/s for a mix of health checks,
-  page reads, list requests, and search queries.
-- Writes to the same file are serialized by the per-path lock; throughput plateaus around
-  **5k req/s** for a single hot page under synthetic load, and drops to ~190 req/s in a
-  realistic write-heavy mix that also creates new files and appends to the log.
-- Creating unique pages is bound by filesystem/metadata overhead; expect **~900 req/s**
-  for sustained unique file creation.
-- Batch ingest writes a source, multiple pages, appends `log.md`, and refreshes `index.md`;
-  realistic throughput is **~19 ingest ops/s** with a small number of concurrent agents.
-- Observer-style polling (changes + periodic index refresh) is intentionally low-frequency
-  and bounded by index refresh cost; p99 latency is dominated by the refresh operation.
-- Real-world throughput will vary based on disk speed, filesystem type, number of files in
-  the wiki, and whether external tools (Obsidian, sync clients) are also accessing the folder.
+| Endpoint | Concurrency | Throughput | p99 |
+| --- | ---: | ---: | ---: |
+| `GET /health` | 200 | ~95,000 req/s | 4 ms |
+| `GET /v1/pages/wiki/...` | 100 | ~45,000 req/s | 11 ms |
+| `PUT /v1/pages/wiki/...` (same page) | 10 | ~4,900 req/s | 3 ms |
+| `POST /v1/ingest` | 1 | ~800 ops/s | 2 ms |

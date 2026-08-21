@@ -425,31 +425,43 @@ Two benchmark scripts are included:
 - `bash scripts/benchmark.sh` — synthetic peak-throughput tests with [autocannon](https://github.com/mcollina/autocannon).
 - `bun run scripts/benchmark-realistic.ts` — realistic mixed-workload scenarios with think times, a seeded wiki, and varied client behaviors.
 
-Measured on a Ryzen 9 7950X3D / 62 GiB / Bun 1.3.13:
+Measured on a Ryzen 9 7950X3D / 62 GiB / Bun 1.3.14 (2026-08-21), SQLite backend,
+no embedder configured (FTS retrieval mode):
 
 ### Synthetic peak throughput
 
-| Endpoint                             | Concurrency |    Throughput | p99 latency |
-| ------------------------------------ | ----------: | ------------: | ----------: |
-| `GET /health`                        |         200 | ~95,000 req/s |        4 ms |
-| `GET /v1/pages/wiki/...`             |         100 | ~45,000 req/s |       11 ms |
-| `PUT /v1/pages/wiki/...` (same page) |          10 |  ~4,900 req/s |        3 ms |
-| `POST /v1/ingest`                    |           1 |    ~800 ops/s |        2 ms |
-| `PUT /v1/pages/wiki/{unique}.md`     |           1 |    ~929 req/s |           — |
+| Endpoint                                 | Concurrency |   Throughput | Notes |
+| ---------------------------------------- | ----------: | -----------: | --- |
+| `GET /health`                            |         200 | ~69,000 req/s | |
+| `GET /v1/pages/wiki/...`                 |          50 | ~33,000 req/s | |
+| `GET /v1/search?q=` (FTS mode)           |          10 |  ~2,300 req/s | FTS5 bm25 |
+| `PUT /v1/pages/wiki/...` (same page)     |          10 |   ~3,400 req/s | per-path lock ceiling |
+| `PUT` unique page creation               |           5 |   ~2,800 req/s | chunk + graph + ledgers |
+| `POST /v1/sources/:path?force=true`      |           5 |   ~4,100 req/s | |
+| `POST /v1/ingest`                        |           1 |      ~90 ops/s | source + 2 pages + log + index |
 
 ### Realistic workload
 
 | Scenario            | Clients | Think time |   Throughput | p99 latency |
 | ------------------- | ------: | ---------: | -----------: | ----------: |
-| Read-heavy browsing |     100 |       50ms | ~3,700 req/s |       16 ms |
-| Mixed read/write    |      50 |       100ms |   ~970 req/s |        8 ms |
-| Write-heavy editing |      25 |       50ms |   ~190 req/s |        1 ms |
-| Batch ingestion     |       3 |       200ms |    ~19 ops/s |       42 ms |
-| Observer polling    |      10 |       500ms |     ~7 req/s |    2,750 ms |
+| Read-heavy browsing |     100 |       50ms | ~3,900 req/s |        8 ms |
+| Mixed read/write    |      50 |      100ms |   ~977 req/s |        8 ms |
+| Write-heavy editing |      25 |       50ms |   ~608 req/s |       48 ms |
+| Batch ingestion     |       3 |      200ms |     ~17 ops/s |      213 ms |
+| Observer polling    |      10 |      500ms |     ~36 req/s |      171 ms |
 
-See [`scripts/benchmark-results.md`](scripts/benchmark-results.md) for full details and raw output.
+### Postgres + pgvector comparison
 
-Benchmarks for the hybrid-search and `/v1/query` pipelines are pending.
+Read paths are at parity with SQLite. Two write/retrieval paths are currently
+slower on Postgres and flagged for optimization (see
+[`scripts/benchmark-results.md`](scripts/benchmark-results.md) for details):
+contended writes pay multi-round-trip ledger commits (~131 req/s vs ~3,200 on
+SQLite at concurrency 5), and FTS ranking computes `ts_rank` for all matches
+(~554 req/s vs ~2,100). Vector (HNSW) retrieval requires an embedder and is not
+yet benchmarked.
+
+See [`scripts/benchmark-results.md`](scripts/benchmark-results.md) for full
+details, methodology notes, and the historical trend.
 
 ## Coexistence with Obsidian, git, and sync tools
 

@@ -338,12 +338,11 @@ async function main() {
         name: "search",
         weight: 5,
         fn: async (agent) => {
-          const field = pick(["title", "body"]);
           const q = pick(["Entity", "LLM", "Overview", "summary"]);
           const res = await request(
             agent,
             "GET",
-            `/v1/search?q=${encodeURIComponent(q)}&in=${field}&limit=20`,
+            `/v1/search?q=${encodeURIComponent(q)}&limit=20`,
             {},
           );
           if (res.statusCode !== 200) throw new Error("bad search");
