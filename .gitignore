@@ -10,3 +10,4 @@ dist/
 *.sqlite-journal
 coverage/
 .todo
+rust/target/
