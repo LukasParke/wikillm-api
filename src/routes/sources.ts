@@ -16,22 +16,14 @@ app.get("/", validateQuery(querySchema), async (c) => {
   const { folder, limit, cursor } = c.get("validatedQuery") as z.infer<
     typeof querySchema
   >;
-  const service = createSourceService(
-    c.get("config").WIKI_ROOT,
-    c.get("db"),
-    c.get("source"),
-  );
+  const service = createSourceService(c.get("deps"), c.get("source"));
   const result = await service.list(folder, limit, cursor);
   return c.json(result);
 });
 
 app.get("/:rel_path{.+}", async (c) => {
   const relPath = c.req.param("rel_path");
-  const service = createSourceService(
-    c.get("config").WIKI_ROOT,
-    c.get("db"),
-    c.get("source"),
-  );
+  const service = createSourceService(c.get("deps"), c.get("source"));
   const source = await service.get(relPath);
   if (!source)
     return c.json(
@@ -52,11 +44,7 @@ app.post("/:rel_path{.+}", async (c) => {
   } else {
     body = Buffer.from(await c.req.arrayBuffer());
   }
-  const service = createSourceService(
-    c.get("config").WIKI_ROOT,
-    c.get("db"),
-    c.get("source"),
-  );
+  const service = createSourceService(c.get("deps"), c.get("source"));
   const result = await service.write({
     rel_path: relPath,
     content: body,
@@ -77,11 +65,7 @@ app.post("/:rel_path{.+}", async (c) => {
 
 app.delete("/:rel_path{.+}", async (c) => {
   const relPath = c.req.param("rel_path");
-  const service = createSourceService(
-    c.get("config").WIKI_ROOT,
-    c.get("db"),
-    c.get("source"),
-  );
+  const service = createSourceService(c.get("deps"), c.get("source"));
   const deleted = await service.delete(relPath);
   if (!deleted)
     return c.json(

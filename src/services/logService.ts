@@ -1,84 +1,51 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
-import type { Database } from "../db/client.js";
-import { insertOperation } from "../db/client.js";
-import { atomicWrite } from "../fs/atomic.js";
-import type { Operation, Source } from "../types/index.js";
 import { ulid } from "ulidx";
+import type { ServiceDeps } from "./pageService.js";
+import { appendLogEntry, parseLog } from "./bundleFiles.js";
+import type { Operation, Source } from "../types/index.js";
 
-export function createLogService(
-  wikiRoot: string,
-  db: Database,
-  source: Source,
-) {
-  const logPath = path.join(wikiRoot, "log.md");
+export interface LogEntry {
+  date: string;
+  kind: string;
+  message: string;
+}
+
+export function createLogService(deps: ServiceDeps, source: Source) {
+  const { config, store, pipeline } = deps;
+  const wikiRoot = config.WIKI_ROOT;
 
   return {
     async get(): Promise<{ content: string; entries: LogEntry[] }> {
-      let content = "";
-      if (existsSync(logPath)) {
-        content = readFileSync(logPath, "utf8");
-      }
-      const entries = parseLogEntries(content);
-      return { content, entries };
+      const logPath = path.join(wikiRoot, "log.md");
+      const content = existsSync(logPath) ? readFileSync(logPath, "utf8") : "";
+      return { content, entries: parseLog(content).reverse() };
     },
 
     async append(
       message: string,
-      prefix?: string,
+      kind?: string,
     ): Promise<{ operationId: string; entry: string }> {
-      const timestamp = new Date().toISOString();
-      const entryLine = `## [${timestamp}] ${prefix ?? source} | ${message}`;
-
-      let existing = "";
-      if (existsSync(logPath)) {
-        existing = readFileSync(logPath, "utf8");
-        if (existing.length > 0 && !existing.endsWith("\n")) {
-          existing += "\n";
-        }
-      }
-
-      const newContent = existing + entryLine + "\n\n";
-      atomicWrite(logPath, newContent);
+      const now = new Date();
+      const entry = appendLogEntry(wikiRoot, message, kind ?? "Update", now);
 
       const operationId = ulid();
       const op: Operation = {
         id: operationId,
-        created_at: timestamp,
+        created_at: now.toISOString(),
         source,
         action: "log_append",
         paths: ["log.md"],
-        metadata: { entry: entryLine },
+        metadata: { entry },
         parent_id: null,
       };
-      insertOperation(db, op);
+      await store.insertOperation(op);
+      await pipeline.handleFileChange("log.md", {
+        source: "api",
+        operationId,
+      });
 
-      return { operationId, entry: entryLine };
+      return { operationId, entry };
     },
   };
-}
-
-export interface LogEntry {
-  timestamp: string;
-  source: string;
-  message: string;
-  raw: string;
-}
-
-function parseLogEntries(content: string): LogEntry[] {
-  const lines = content.split("\n");
-  const entries: LogEntry[] = [];
-  const regex = /^##\s+\[([^\]]+)\]\s+(.+?)\s+\|\s+(.+)$/;
-  for (const line of lines) {
-    const match = line.match(regex);
-    if (match) {
-      entries.push({
-        timestamp: match[1],
-        source: match[2].trim(),
-        message: match[3].trim(),
-        raw: line,
-      });
-    }
-  }
-  return entries.reverse(); // newest first
 }

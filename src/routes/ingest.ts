@@ -26,11 +26,7 @@ const app = new Hono<{ Variables: AppVariables }>();
 
 app.post("/", validateBody(ingestSchema), async (c) => {
   const body = c.get("validatedBody") as z.infer<typeof ingestSchema>;
-  const service = createIngestService(
-    c.get("config").WIKI_ROOT,
-    c.get("db"),
-    c.get("source"),
-  );
+  const service = createIngestService(c.get("deps"), c.get("source"));
   const result = await service.run({
     source: {
       ...body.source,

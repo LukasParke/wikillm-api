@@ -1,18 +1,12 @@
-import { existsSync, statSync } from "node:fs";
-import path from "node:path";
-import type { Database } from "../db/client.js";
-import { insertChange, insertOperation } from "../db/client.js";
+import { existsSync, unlinkSync } from "node:fs";
+import { ulid } from "ulidx";
+import type { Config } from "../config.js";
 import { atomicWrite, hashContent, readFileAtomic } from "../fs/atomic.js";
 import { pathLock } from "../fs/lock.js";
 import { normalizeRelPath, resolveWikiPath } from "../fs/paths.js";
-import { ensureParentDir, readSource } from "../fs/wiki.js";
-import type {
-  ChangeEvent,
-  Operation,
-  Source,
-  SourceFile,
-} from "../types/index.js";
-import { ulid } from "ulidx";
+import { ensureParentDir, listSources, readSource } from "../fs/wiki.js";
+import type { ServiceDeps } from "./pageService.js";
+import type { Operation, Source, SourceFile } from "../types/index.js";
 
 export interface SourceWriteInput {
   rel_path: string;
@@ -27,19 +21,16 @@ export interface SourceWriteResult {
   existingHash?: string;
 }
 
-export function createSourceService(
-  wikiRoot: string,
-  db: Database,
-  source: Source,
-) {
+export function createSourceService(deps: ServiceDeps, source: Source) {
+  const { config, store, pipeline } = deps;
+  const wikiRoot = config.WIKI_ROOT;
+
   return {
     async get(relPath: string): Promise<SourceFile | null> {
-      const normalized = normalizeRelPath(relPath);
-      return readSource(wikiRoot, normalized);
+      return readSource(wikiRoot, normalizeRelPath(relPath));
     },
 
     async list(folder?: string, limit?: number, cursor?: string) {
-      const { listSources } = await import("../fs/wiki.js");
       return listSources(wikiRoot, { folder, limit, cursor });
     },
 
@@ -68,35 +59,25 @@ export function createSourceService(
           : Buffer.from(input.content, "utf8");
         atomicWrite(absPath, data);
 
+        const now = new Date().toISOString();
         const operationId = ulid();
         const op: Operation = {
           id: operationId,
-          created_at: new Date().toISOString(),
+          created_at: now,
           source,
           action: exists ? "update" : "create",
           paths: [relPath],
           metadata: { existingHash, newHash: hashContent(data) },
           parent_id: null,
         };
-        insertOperation(db, op);
+        await store.insertOperation(op);
+        await pipeline.handleFileChange(relPath, {
+          source: "api",
+          operationId,
+        });
 
-        const change: ChangeEvent = {
-          type: "change",
-          data: {
-            id: ulid(),
-            rel_path: relPath,
-            change_type: exists ? "modified" : "created",
-            old_hash: existingHash ?? null,
-            new_hash: hashContent(data),
-            source: "api",
-            operation_id: operationId,
-            detected_at: op.created_at,
-          },
-        };
-        insertChange(db, change.data);
-
-        const sourceFile = readSource(wikiRoot, relPath)!;
-        return { success: true, source: sourceFile, operationId };
+        const sourceFile = readSource(wikiRoot, relPath);
+        return { success: true, source: sourceFile ?? undefined, operationId };
       });
     },
 
@@ -107,29 +88,23 @@ export function createSourceService(
       return pathLock.runExclusive(normalized, async () => {
         if (!existsSync(absPath)) return false;
         const { hash } = readFileAtomic(absPath);
-        const { unlinkSync } = await import("node:fs");
         unlinkSync(absPath);
 
+        const now = new Date().toISOString();
         const operationId = ulid();
         const op: Operation = {
           id: operationId,
-          created_at: new Date().toISOString(),
+          created_at: now,
           source,
           action: "delete",
           paths: [normalized],
           metadata: { oldHash: hash },
           parent_id: null,
         };
-        insertOperation(db, op);
-        insertChange(db, {
-          id: ulid(),
-          rel_path: normalized,
-          change_type: "deleted",
-          old_hash: hash,
-          new_hash: null,
+        await store.insertOperation(op);
+        await pipeline.handleFileChange(normalized, {
           source: "api",
-          operation_id: operationId,
-          detected_at: op.created_at,
+          operationId,
         });
         return true;
       });

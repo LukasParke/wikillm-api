@@ -8,17 +8,48 @@ services:
       - WIKI_ROOT=/wiki
       - API_KEYS=${API_KEYS}
       - PUBLIC_READ=${PUBLIC_READ:-true}
-      - DB_PATH=/wiki/.wikillm-api.db
+      # Index backend: postgres (default when DATABASE_URL set) or sqlite
+      - DB_BACKEND=${DB_BACKEND:-postgres}
+      - DATABASE_URL=${DATABASE_URL:-postgres://wikillm:wikillm@db:5432/wikillm}
+      # Retrieval / LLM (optional; any OpenAI-compatible endpoint)
+      - LLM_BASE_URL=${LLM_BASE_URL:-}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_MODEL=${LLM_MODEL:-llama3.1}
+      - LLM_EMBED_MODEL=${LLM_EMBED_MODEL:-}
+      - EMBEDDING_DIMS=${EMBEDDING_DIMS:-1536}
+      - LLM_DISTILL=${LLM_DISTILL:-false}
+      # Governance
+      - RATE_LIMIT_RPM=${RATE_LIMIT_RPM:-0}
+      - HUMAN_ACTORS=${HUMAN_ACTORS:-}
       - LOG_LEVEL=${LOG_LEVEL:-info}
     volumes:
       # Local directory mount (default)
       - ${WIKI_PATH:-./wiki}:/wiki
-      # Or mount a remote/network filesystem path from the host:
-      # - /mnt/nas/wiki:/wiki
     restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 5s
+
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      - POSTGRES_USER=wikillm
+      - POSTGRES_PASSWORD=wikillm
+      - POSTGRES_DB=wikillm
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wikillm -d wikillm"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  pgdata:

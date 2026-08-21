@@ -1,82 +1,47 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
-import matter from "gray-matter";
-import type { Database } from "../db/client.js";
-import { insertOperation, listPageCache } from "../db/client.js";
-import { atomicWrite } from "../fs/atomic.js";
-import { resolveWikiPath } from "../fs/paths.js";
-import type { Operation, Page, Source } from "../types/index.js";
 import { ulid } from "ulidx";
+import type { ServiceDeps } from "./pageService.js";
+import { writeIndexFile } from "./bundleFiles.js";
+import type { DocumentRecord } from "../store/types.js";
+import type { Operation, Source } from "../types/index.js";
 
-export function createIndexService(
-  wikiRoot: string,
-  db: Database,
-  source: Source,
-) {
-  const indexPath = path.join(wikiRoot, "index.md");
+export function createIndexService(deps: ServiceDeps, source: Source) {
+  const { config, store, pipeline } = deps;
+  const wikiRoot = config.WIKI_ROOT;
 
   return {
-    async get(): Promise<{ content: string; pages: Page[] }> {
-      let content = "";
-      if (existsSync(indexPath)) {
-        content = readFileSync(indexPath, "utf8");
-      }
-      const pages = listPageCache(db, { folder: "wiki", limit: 10000 }).items;
-      return { content, pages };
+    async get(): Promise<{ content: string; pages: DocumentRecord[] }> {
+      const indexPath = path.join(wikiRoot, "index.md");
+      const content = existsSync(indexPath)
+        ? readFileSync(indexPath, "utf8")
+        : "";
+      const pages = await store.listDocuments({ folder: "wiki", limit: 10000 });
+      return { content, pages: pages.items };
     },
 
     async refresh(): Promise<{ operationId: string; pageCount: number }> {
-      const pages = listPageCache(db, { folder: "wiki", limit: 10000 }).items;
+      const docs = await store.listDocuments({ folder: "wiki", limit: 10000 });
+      writeIndexFile(wikiRoot, docs.items, source);
 
-      const byCategory = new Map<string, Page[]>();
-      for (const page of pages) {
-        const tags = Array.isArray(page.frontmatter.tags)
-          ? page.frontmatter.tags
-          : [];
-        const category =
-          (page.frontmatter.category as string) ??
-          (tags[0] as string) ??
-          "Uncategorized";
-        const list = byCategory.get(category) ?? [];
-        list.push(page);
-        byCategory.set(category, list);
-      }
-
-      const lines: string[] = ["# Wiki Index", ""];
-      lines.push(`Generated at ${new Date().toISOString()} by ${source}`);
-      lines.push("");
-
-      for (const [category, catPages] of Array.from(
-        byCategory.entries(),
-      ).sort()) {
-        lines.push(`## ${category}`);
-        lines.push("");
-        for (const page of catPages.sort((a, b) =>
-          a.rel_path.localeCompare(b.rel_path),
-        )) {
-          const title = page.title ?? page.rel_path;
-          const summary = page.summary ? ` — ${page.summary}` : "";
-          lines.push(`- [[${title}]] (${page.rel_path})${summary}`);
-        }
-        lines.push("");
-      }
-
-      const content = lines.join("\n");
-      atomicWrite(indexPath, content);
-
+      const now = new Date().toISOString();
       const operationId = ulid();
       const op: Operation = {
         id: operationId,
-        created_at: new Date().toISOString(),
+        created_at: now,
         source,
         action: "index_refresh",
         paths: ["index.md"],
-        metadata: { pageCount: pages.length },
+        metadata: { pageCount: docs.items.length },
         parent_id: null,
       };
-      insertOperation(db, op);
+      await store.insertOperation(op);
+      await pipeline.handleFileChange("index.md", {
+        source: "api",
+        operationId,
+      });
 
-      return { operationId, pageCount: pages.length };
+      return { operationId, pageCount: docs.items.length };
     },
   };
 }

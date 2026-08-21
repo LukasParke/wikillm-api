@@ -1,30 +1,35 @@
-import {
-  createServer,
-  type IncomingMessage,
-  type ServerResponse,
-} from "node:http";
+import { createServer, type IncomingMessage } from "node:http";
 import { serve } from "@hono/node-server";
 import { WebSocketServer, type WebSocket } from "ws";
 import { loadConfig } from "./config.js";
-import { createDatabase, migrate } from "./db/client.js";
 import { cleanupTempFiles } from "./fs/atomic.js";
-import { syncFullCache, createWatcher } from "./fs/watcher.js";
+import { createWatcher } from "./fs/watcher.js";
 import { createApp } from "./app.js";
 import { createBroadcaster } from "./services/broadcaster.js";
+import {
+  createServices,
+  startConnectors,
+  stopConnectors,
+} from "./services/container.js";
 import type { WSContext } from "hono/ws";
 
 const config = loadConfig();
-const db = await createDatabase(config.DB_PATH ?? "wikillm-api.db");
-migrate(db);
 cleanupTempFiles(config.WIKI_ROOT);
-syncFullCache(config.WIKI_ROOT, db);
+
+const services = await createServices(config);
+await services.pipeline.reindexAll();
 
 const broadcaster = createBroadcaster();
-const watcher = createWatcher(config.WIKI_ROOT, db, {
-  onChange: (event) => broadcaster.broadcast(event),
-});
+services.pipeline.setChangeEmitter((event) => broadcaster.broadcast(event));
+const watcher = createWatcher(config.WIKI_ROOT, services.pipeline, broadcaster);
+await startConnectors(services);
 
-const app = createApp({ config, db, broadcaster });
+const app = createApp({
+  config,
+  store: services.store,
+  services,
+  broadcaster,
+});
 
 const wss = new WebSocketServer({ noServer: true });
 
@@ -35,40 +40,33 @@ wss.on("connection", (ws: WebSocket) => {
   );
   ws.on("message", (data: Buffer | ArrayBuffer | Buffer[]) => {
     try {
-      const msg = JSON.parse(data.toString());
+      const msg = JSON.parse(data.toString()) as { type?: string };
       if (msg.type === "ping") {
         ws.send(
           JSON.stringify({ type: "pong", time: new Date().toISOString() }),
         );
       }
     } catch {
-      // ignore
+      // ignore non-JSON frames
     }
   });
 });
 
-const server = serve(
-  {
-    fetch: app.fetch,
-    port: config.PORT,
-    hostname: config.HOST,
-  } as any,
-  {
-    createServer: (options: any, handler: any) => {
-      const srv = createServer(handler);
-      srv.on("upgrade", (request, socket, head) => {
-        if (request.url?.startsWith("/v1/ws")) {
-          wss.handleUpgrade(request, socket, head, (ws) => {
-            wss.emit("connection", ws, request);
-          });
-        } else {
-          socket.destroy();
-        }
-      });
-      return srv;
-    },
-  } as any,
-);
+const server = serve({
+  fetch: app.fetch,
+  port: config.PORT,
+  hostname: config.HOST,
+});
+
+server.on("upgrade", (request, socket, head) => {
+  if (request.url?.startsWith("/v1/ws")) {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit("connection", ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
+});
 
 console.log(
   `WikiLLM API (Node) listening on http://${config.HOST}:${config.PORT}`,
@@ -78,11 +76,10 @@ console.log(`Wiki root: ${config.WIKI_ROOT}`);
 function shutdown() {
   console.log("Shutting down...");
   watcher.close();
+  stopConnectors(services);
   server.close();
   wss.close();
-  db.close();
-  process.exit(0);
+  void services.store.close().finally(() => process.exit(0));
 }
 
 process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);

@@ -1,7 +1,6 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import type { AppVariables } from "../app.js";
-import { listChanges } from "../db/client.js";
 import { validateQuery } from "../middleware/validate.js";
 
 const querySchema = z.object({
@@ -15,7 +14,7 @@ const app = new Hono<{ Variables: AppVariables }>();
 
 app.get("/", validateQuery(querySchema), async (c) => {
   const query = c.get("validatedQuery") as z.infer<typeof querySchema>;
-  const changes = listChanges(c.get("db"), {
+  const changes = await c.get("store").listChanges({
     since: query.since,
     path: query.path,
     source: query.source,

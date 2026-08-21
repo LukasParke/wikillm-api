@@ -15,11 +15,18 @@ info:
 
     ## Features
 
-    - Filesystem remains the source of truth
+    - Self-hosted knowledge base service for humans and agents
+    - Filesystem remains the source of truth; the index is a rebuildable cache
     - Atomic writes with optimistic concurrency control
-    - Multi-source API key attribution
+    - Multi-source API key attribution with OKF actor convention
+    - Hybrid retrieval: full-text + vector + recency decay, RRF fusion (K=60), optional rerank
+    - LLM answering with citations (planner → executor → synthesis)
     - SSE and WebSocket live change feeds
     - Batch ingestion of sources and wiki pages
+    - Connector framework (git, web, GitHub)
+    - MCP server exposing LLM-free retrieval tools
+    - Projects scoping with per-key RBAC (read/write/admin)
+    - Google OKF v0.2 conformance: validation, trust tiers, provenance stamping
   version: 0.1.0
   contact:
     name: WikiLLM API
@@ -51,6 +58,22 @@ tags:
     description: SSE and WebSocket change streams
   - name: Ingest
     description: Batch ingestion of sources and wiki pages
+  - name: Query
+    description: LLM-answered questions with citations
+  - name: Graph
+    description: Link graph traversal
+  - name: OKF
+    description: Open Knowledge Format validation and layout
+  - name: Bundle
+    description: Tarball export and import of the whole bundle
+  - name: Connectors
+    description: External source ingestion (git, web, GitHub)
+  - name: Projects
+    description: Named project scoping
+  - name: Admin
+    description: Reindex and store stats (admin only)
+  - name: Feedback
+    description: Query answer feedback
 
 security:
   - bearerAuth: []
@@ -356,6 +379,345 @@ components:
         raw:
           type: string
 
+    SearchResult:
+      type: object
+      required:
+        - rel_path
+        - score
+      properties:
+        rel_path:
+          type: string
+          example: wiki/concepts/Rerank.md
+        title:
+          type: string
+          nullable: true
+          example: Rerank
+        kind:
+          type: string
+          example: page
+        origin:
+          type: string
+          nullable: true
+          description: Connector id or actor that produced the document
+        okf_type:
+          type: string
+          nullable: true
+          example: concept
+        tags:
+          type: array
+          items:
+            type: string
+        status:
+          type: string
+          nullable: true
+          example: stable
+        stale_after:
+          type: string
+          format: date-time
+          nullable: true
+        trust:
+          type: string
+          nullable: true
+          enum:
+            - unverified
+            - machine-confirmed
+            - human-reviewed
+        hash:
+          type: string
+          description: SHA-256 of the document content
+        mtime:
+          type: number
+          description: File modification time in milliseconds
+        heading_path:
+          type: array
+          items:
+            type: string
+          description: Heading ancestry of the matching chunk
+        snippet:
+          type: string
+        score:
+          type: number
+          description: RRF-fused retrieval score
+        context:
+          type: string
+          nullable: true
+          description: Neighboring sections pulled in by context expansion
+
+    SearchResultList:
+      type: object
+      required:
+        - query
+        - mode
+        - latency_ms
+        - results
+      properties:
+        query:
+          type: string
+        mode:
+          type: string
+          enum:
+            - hybrid
+            - fts
+          description: fts when no embedder is configured
+        latency_ms:
+          type: number
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/SearchResult"
+
+    QueryRequest:
+      type: object
+      required:
+        - question
+      properties:
+        question:
+          type: string
+        project:
+          type: string
+          description: Optional project scope for retrieval
+
+    Citation:
+      type: object
+      required:
+        - rel_path
+        - hash
+      properties:
+        rel_path:
+          type: string
+        hash:
+          type: string
+          description: Content hash the quote refers to (immutable)
+        quote:
+          type: string
+
+    QueryAnswer:
+      type: object
+      required:
+        - answer
+        - citations
+      properties:
+        answer:
+          type: string
+        citations:
+          type: array
+          items:
+            $ref: "#/components/schemas/Citation"
+        evidence:
+          type: array
+          items:
+            type: object
+          description: Normalized retrieval evidence used for synthesis
+        toolsUsed:
+          type: array
+          items:
+            type: string
+
+    GraphNode:
+      type: object
+      required:
+        - rel_path
+      properties:
+        rel_path:
+          type: string
+        title:
+          type: string
+          nullable: true
+        exists:
+          type: boolean
+          description: False for broken links tolerated per the OKF spec
+
+    GraphEdge:
+      type: object
+      required:
+        - src
+        - dst
+      properties:
+        src:
+          type: string
+        dst:
+          type: string
+
+    GraphResponse:
+      type: object
+      required:
+        - nodes
+        - edges
+      properties:
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/GraphNode"
+        edges:
+          type: array
+          items:
+            $ref: "#/components/schemas/GraphEdge"
+
+    OkfValidateReport:
+      type: object
+      required:
+        - valid
+      properties:
+        valid:
+          type: boolean
+        errors:
+          type: array
+          items:
+            type: object
+        warnings:
+          type: array
+          items:
+            type: object
+        stats:
+          type: object
+          description: Bundle-level statistics (whole-bundle validation only)
+
+    LayoutInfo:
+      type: object
+      required:
+        - profile
+      properties:
+        profile:
+          type: string
+          enum:
+            - okf
+            - wikillm
+
+    ConnectorCreateInput:
+      type: object
+      required:
+        - kind
+        - config
+      properties:
+        kind:
+          type: string
+          enum:
+            - git
+            - web
+            - github
+        config:
+          type: object
+          description: |
+            Kind-specific configuration. git: {url, branch?, extensions?: [".md"]}.
+            web: {urls: [...]}. github: {repo: "owner/name", token?, include?: ["issues", "pulls", "releases"]}.
+        id:
+          type: string
+          description: Optional explicit connector id
+        enabled:
+          type: boolean
+          default: true
+
+    Connector:
+      type: object
+      required:
+        - id
+        - kind
+        - config
+        - enabled
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+          enum:
+            - git
+            - web
+            - github
+        config:
+          type: object
+        enabled:
+          type: boolean
+
+    ConnectorList:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Connector"
+
+    ConnectorRunResult:
+      type: object
+      required:
+        - docs
+      properties:
+        docs:
+          type: integer
+          description: Number of documents ingested by this run
+
+    ProjectInput:
+      type: object
+      required:
+        - prefixes
+      properties:
+        description:
+          type: string
+        prefixes:
+          type: array
+          items:
+            type: string
+          description: Path prefixes belonging to this project
+        connectors:
+          type: array
+          items:
+            type: string
+          description: Connector ids attached to this project
+
+    Project:
+      type: object
+      required:
+        - name
+        - prefixes
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+          nullable: true
+        prefixes:
+          type: array
+          items:
+            type: string
+        connectors:
+          type: array
+          items:
+            type: string
+
+    ProjectList:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Project"
+
+    ReindexResult:
+      type: object
+      required:
+        - documents
+      properties:
+        documents:
+          type: integer
+          description: Number of documents reindexed
+
+    FeedbackInput:
+      type: object
+      required:
+        - query_id
+        - helpful
+      properties:
+        query_id:
+          type: string
+        helpful:
+          type: boolean
+        comment:
+          type: string
+          nullable: true
+
 paths:
   /health:
     get:
@@ -386,6 +748,23 @@ paths:
                     type: string
                   public_read:
                     type: boolean
+
+  /metrics:
+    get:
+      tags:
+        - Health
+      summary: Prometheus metrics
+      description: |
+        Prometheus text exposition format (wikillm_requests_total,
+        wikillm_request_duration_seconds, ...).
+      security: []
+      responses:
+        "200":
+          description: Metrics in Prometheus text exposition format
+          content:
+            text/plain:
+              schema:
+                type: string
 
   /v1/pages:
     get:
@@ -749,6 +1128,52 @@ paths:
         - Search
       summary: Search wiki pages
       parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: type
+          in: query
+          schema:
+            type: string
+          description: Filter by OKF type frontmatter
+        - name: tags
+          in: query
+          schema:
+            type: string
+          description: Comma-separated tag filter (all must match)
+        - name: status
+          in: query
+          schema:
+            type: string
+          description: Filter by lifecycle status frontmatter
+        - name: trust
+          in: query
+          schema:
+            type: string
+            enum:
+              - unverified
+              - machine-confirmed
+              - human-reviewed
+          description: Filter by derived trust tier
+        - name: fresh
+          in: query
+          schema:
+            type: boolean
+          description: When true, exclude documents past their stale_after date
+        - name: origin
+          in: query
+          schema:
+            type: string
+          description: Filter by origin (connector id or actor)
+        - name: project
+          in: query
+          schema:
+            type: string
+          description: Restrict retrieval to a project scope
         - name: q
           in: query
           required: true
@@ -764,33 +1189,13 @@ paths:
               - body
               - frontmatter
           description: Field to search in
-        - name: limit
-          in: query
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 100
-            default: 20
       responses:
         "200":
-          description: Search results
+          description: Search results with hybrid or full-text mode
           content:
             application/json:
               schema:
-                type: object
-                required:
-                  - query
-                  - in
-                  - results
-                properties:
-                  query:
-                    type: string
-                  in:
-                    type: string
-                  results:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/Page"
+                $ref: "#/components/schemas/SearchResultList"
 
   /v1/changes:
     get:
@@ -888,3 +1293,378 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/IngestResult"
+
+  /v1/query:
+    post:
+      tags:
+        - Query
+      summary: Ask a question
+      description: |
+        Runs planner → executor → synthesis over the knowledge base and returns an
+        answer with citations. Requires a configured LLM; otherwise returns
+        503 {"error": "llm_not_configured"}.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+      responses:
+        "200":
+          description: Answer with citations
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryAnswer"
+        "503":
+          description: No LLM configured
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    example: llm_not_configured
+
+  /v1/graph/{rel_path}:
+    parameters:
+      - name: rel_path
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Relative path of the page, e.g. wiki/entities/OpenAI.md
+        example: wiki/entities/OpenAI.md
+
+    get:
+      tags:
+        - Graph
+      summary: Link graph neighbors
+      description: Returns nodes and edges around a page, following wiki links.
+      parameters:
+        - name: depth
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 3
+            default: 1
+      responses:
+        "200":
+          description: Graph neighborhood
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GraphResponse"
+        "404":
+          description: Page not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/okf/validate:
+    post:
+      tags:
+        - OKF
+      summary: Validate the bundle or a single document
+      description: |
+        Empty body validates the whole bundle and returns a report with errors,
+        warnings, and stats. A {content: "..."} body instead checks that single document.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                content:
+                  type: string
+                  description: Markdown document (with frontmatter) to validate
+      responses:
+        "200":
+          description: Validation report
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkfValidateReport"
+
+  /v1/okf/layout:
+    get:
+      tags:
+        - OKF
+      summary: Active layout profile
+      responses:
+        "200":
+          description: Active layout profile
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LayoutInfo"
+
+  /v1/bundle/export:
+    get:
+      tags:
+        - Bundle
+      summary: Export the bundle
+      description: Streams the whole knowledge base as a .tar.gz archive.
+      responses:
+        "200":
+          description: Bundle tarball
+          content:
+            application/gzip:
+              schema:
+                type: string
+                format: binary
+
+  /v1/bundle/import:
+    post:
+      tags:
+        - Bundle
+      summary: Import a bundle
+      description: |
+        Imports a previously exported .tar.gz bundle (admin only). Without force,
+        conflicting paths return 409 with the conflict list.
+      parameters:
+        - name: force
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Overwrite conflicting paths
+      requestBody:
+        required: true
+        content:
+          application/gzip:
+            schema:
+              type: string
+              format: binary
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: Bundle imported
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - success
+                properties:
+                  success:
+                    type: boolean
+        "409":
+          description: Conflicting paths without force
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/connectors:
+    get:
+      tags:
+        - Connectors
+      summary: List connectors
+      responses:
+        "200":
+          description: Registered connectors
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConnectorList"
+
+    post:
+      tags:
+        - Connectors
+      summary: Register a connector
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConnectorCreateInput"
+      responses:
+        "201":
+          description: Connector created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Connector"
+
+  /v1/connectors/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Connector id
+
+    delete:
+      tags:
+        - Connectors
+      summary: Delete a connector
+      responses:
+        "200":
+          description: Connector deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - success
+                properties:
+                  success:
+                    type: boolean
+        "404":
+          description: Unknown connector
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/connectors/{id}/run:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Connector id
+
+    post:
+      tags:
+        - Connectors
+      summary: Run a connector now
+      responses:
+        "200":
+          description: Connector run completed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConnectorRunResult"
+        "404":
+          description: Unknown connector
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/projects:
+    get:
+      tags:
+        - Projects
+      summary: List projects
+      responses:
+        "200":
+          description: Projects
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectList"
+
+  /v1/projects/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Project name
+
+    put:
+      tags:
+        - Projects
+      summary: Create or update a project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProjectInput"
+      responses:
+        "200":
+          description: Project saved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+
+    delete:
+      tags:
+        - Projects
+      summary: Delete a project
+      responses:
+        "200":
+          description: Project deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - success
+                properties:
+                  success:
+                    type: boolean
+        "404":
+          description: Unknown project
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/admin/reindex:
+    post:
+      tags:
+        - Admin
+      summary: Rebuild the index from the filesystem
+      responses:
+        "200":
+          description: Reindex completed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReindexResult"
+
+  /v1/admin/stats:
+    get:
+      tags:
+        - Admin
+      summary: Store overview stats
+      responses:
+        "200":
+          description: Store statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                description: Overview stats of the index store
+
+  /v1/feedback:
+    post:
+      tags:
+        - Feedback
+      summary: Rate a query answer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FeedbackInput"
+      responses:
+        "201":
+          description: Feedback recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - success
+                properties:
+                  success:
+                    type: boolean

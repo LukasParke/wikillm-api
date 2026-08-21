@@ -2,9 +2,14 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import path from "node:path";
 import os from "node:os";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { createDatabase, migrate } from "../../src/db/client.js";
-import { syncFullCache, createWatcher } from "../../src/fs/watcher.js";
-import { createBroadcaster } from "../../src/services/broadcaster.js";
+import { loadConfig } from "../../src/config.js";
+import { createStore } from "../../src/store/index.js";
+import type { Store } from "../../src/store/types.js";
+import { IndexPipeline } from "../../src/services/pipeline.js";
+import {
+  createWatcher,
+  type WatcherBroadcaster,
+} from "../../src/fs/watcher.js";
 import type { ChangeEvent } from "../../src/types/index.js";
 
 function makeRoot(): string {
@@ -16,64 +21,92 @@ function makeRoot(): string {
   return dir;
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+// chokidar + FS events are genuinely asynchronous at the platform level, so
+// these integration checks await conditions on the real clock.
+async function waitFor(
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs = 3000,
+): Promise<boolean> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (await predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return predicate();
+}
+
+class CollectingBroadcaster implements WatcherBroadcaster {
+  readonly events: ChangeEvent[] = [];
+  broadcast(event: ChangeEvent): void {
+    this.events.push(event);
+  }
 }
 
 describe("file watcher", () => {
   let root: string;
-  let db: Awaited<ReturnType<typeof createDatabase>>;
-  let cleanup: () => void;
+  let store: Store;
+  let pipeline: IndexPipeline;
+  let watcher: { close: () => unknown } | null = null;
+  let broadcaster: CollectingBroadcaster;
 
   beforeEach(async () => {
     root = makeRoot();
-    db = await createDatabase(path.join(root, "test.db"));
-    migrate(db);
-    syncFullCache(root, db);
-    cleanup = () => {
-      db.close();
-      rmSync(root, { recursive: true, force: true });
-    };
+    process.env.WIKI_ROOT = root;
+    process.env.API_KEYS = "test:key1";
+    process.env.DB_PATH = path.join(root, "test.db");
+    const config = loadConfig();
+    store = await createStore(config);
+    pipeline = new IndexPipeline(root, store, null);
+    broadcaster = new CollectingBroadcaster();
   });
 
-  afterEach(() => cleanup());
+  afterEach(async () => {
+    watcher?.close();
+    delete process.env.WIKI_ROOT;
+    delete process.env.API_KEYS;
+    delete process.env.DB_PATH;
+    rmSync(root, { recursive: true, force: true });
+    await store.close();
+  });
 
   it("detects external file creation and broadcasts", async () => {
-    const events: ChangeEvent[] = [];
-    const broadcaster = createBroadcaster();
-    const watcher = createWatcher(root, db, {
-      onChange: (e) => events.push(e),
-      onReady: () => {},
-    });
-    await delay(200);
-
     mkdirSync(path.join(root, "wiki"), { recursive: true });
+    watcher = createWatcher(root, pipeline, broadcaster);
+    await waitFor(() => broadcaster.events.length > 0, 1000); // chokidar ready settle
+
     writeFileSync(path.join(root, "wiki", "external.md"), "# External");
 
-    await delay(300);
-
-    expect(events.some((e) => e.data.rel_path === "wiki/external.md")).toBe(
-      true,
+    const seen = await waitFor(() =>
+      broadcaster.events.some((e) => e.data.rel_path === "wiki/external.md"),
     );
-    await watcher.close();
+    expect(seen).toBe(true);
+  });
+
+  it("indexes external files into the document store", async () => {
+    mkdirSync(path.join(root, "wiki"), { recursive: true });
+    watcher = createWatcher(root, pipeline, broadcaster);
+    await new Promise((resolve) => setTimeout(resolve, 300)); // watcher startup
+
+    writeFileSync(path.join(root, "wiki", "indexed.md"), "# Indexed page");
+
+    const indexed = await waitFor(async () => {
+      const doc = await store.getDocument("wiki/indexed.md");
+      return doc !== null && doc.hash.length === 64;
+    }, 3000);
+    expect(indexed).toBe(true);
   });
 
   it("ignores .obsidian files", async () => {
-    const events: ChangeEvent[] = [];
-    const watcher = createWatcher(root, db, {
-      onChange: (e) => events.push(e),
-      onReady: () => {},
-    });
-    await delay(200);
+    watcher = createWatcher(root, pipeline, broadcaster);
+    await new Promise((resolve) => setTimeout(resolve, 300));
 
     mkdirSync(path.join(root, ".obsidian"), { recursive: true });
     writeFileSync(path.join(root, ".obsidian", "workspace.json"), "{}");
 
-    await delay(300);
+    await new Promise((resolve) => setTimeout(resolve, 500));
 
-    expect(events.some((e) => e.data.rel_path.includes(".obsidian"))).toBe(
-      false,
-    );
-    await watcher.close();
+    expect(
+      broadcaster.events.some((e) => e.data.rel_path.includes(".obsidian")),
+    ).toBe(false);
   });
 });

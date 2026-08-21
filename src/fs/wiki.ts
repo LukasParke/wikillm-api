@@ -66,7 +66,7 @@ export function readPage(wikiRoot: string, relPath: string): Page | null {
     word_count: wordCount,
     outgoing_links: outgoing,
     hash,
-    mtime: stat.mtimeMs,
+    mtime: Math.floor(stat.mtimeMs),
     updated_at: (parsed.data?.updated_at as string) ?? null,
     updated_by: (parsed.data?.updated_by as string) ?? null,
   };
@@ -110,7 +110,7 @@ export function readSource(
     content_type: inferContentType(relPath),
     size: stat.size,
     hash: hashContent(buf),
-    mtime: stat.mtimeMs,
+    mtime: Math.floor(stat.mtimeMs),
   };
 }
 

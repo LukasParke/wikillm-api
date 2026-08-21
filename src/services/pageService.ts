@@ -1,18 +1,16 @@
-import { existsSync, statSync } from "node:fs";
+import { existsSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import matter from "gray-matter";
-import type { Database } from "../db/client.js";
-import {
-  insertChange,
-  insertOperation,
-  upsertPageCache,
-} from "../db/client.js";
+import { ulid } from "ulidx";
+import type { Config } from "../config.js";
 import { atomicWrite, readFileAtomic } from "../fs/atomic.js";
 import { pathLock } from "../fs/lock.js";
 import { normalizeRelPath, resolveWikiPath } from "../fs/paths.js";
 import { ensureParentDir, readPage } from "../fs/wiki.js";
-import type { ChangeEvent, Operation, Page, Source } from "../types/index.js";
-import { ulid } from "ulidx";
+import { actorFromSource } from "../okf/trust.js";
+import type { Store } from "../store/types.js";
+import type { IndexPipeline } from "./pipeline.js";
+import type { Operation, Page, Source } from "../types/index.js";
 
 export interface PageWriteInput {
   rel_path: string;
@@ -28,20 +26,54 @@ export interface PageWriteResult {
   operationId?: string;
 }
 
+export interface ServiceDeps {
+  config: Config;
+  store: Store;
+  pipeline: IndexPipeline;
+}
+
+export function parseHumanActors(raw: string | undefined): Set<string> {
+  return new Set(
+    (raw ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+}
+
 export function createPageService(
-  wikiRoot: string,
-  db: Database,
+  deps: ServiceDeps,
   source: Source,
-) {
+): {
+  get(relPath: string): Promise<Page | null>;
+  list(
+    folder?: string,
+    limit?: number,
+    cursor?: string,
+  ): Promise<{ items: Page[]; nextCursor?: string }>;
+  write(input: PageWriteInput): Promise<PageWriteResult>;
+  delete(relPath: string, ifMatch?: string): Promise<PageWriteResult>;
+} {
+  const { config, store, pipeline } = deps;
+  const wikiRoot = config.WIKI_ROOT;
+  const actor = actorFromSource(source, parseHumanActors(config.HUMAN_ACTORS));
+
   return {
     async get(relPath: string): Promise<Page | null> {
-      const normalized = normalizeRelPath(relPath);
-      return readPage(wikiRoot, normalized);
+      return readPage(wikiRoot, normalizeRelPath(relPath));
     },
 
     async list(folder?: string, limit?: number, cursor?: string) {
-      const { listPageCache } = await import("../db/client.js");
-      return listPageCache(db, { folder, limit, cursor });
+      const result = await store.listDocuments({
+        folder,
+        kind: "page",
+        limit,
+        cursor,
+      });
+      return {
+        items: result.items.map(documentToPageSummary),
+        nextCursor: result.nextCursor,
+      };
     },
 
     async write(input: PageWriteInput): Promise<PageWriteResult> {
@@ -68,51 +100,34 @@ export function createPageService(
           // Tried to update a file that does not exist
           return { success: false, conflict: { hash: "", content: "" } };
         }
+        const oldHash = exists ? readFileAtomic(absPath).hash : null;
 
+        const now = new Date().toISOString();
         const fm: Record<string, unknown> = { ...(input.frontmatter ?? {}) };
-        if (!("updated_at" in fm)) {
-          fm.updated_at = new Date().toISOString();
-        }
-        if (!("updated_by" in fm)) {
-          fm.updated_by = source;
-        }
+        if (!("updated_at" in fm)) fm.updated_at = now;
+        if (!("updated_by" in fm)) fm.updated_by = source;
+        if (!("generated" in fm)) fm.generated = { by: actor, at: now };
 
-        const fileContent = matter.stringify(input.content, fm);
-        atomicWrite(absPath, fileContent);
+        atomicWrite(absPath, matter.stringify(input.content, fm));
 
-        const stat = statSync(absPath);
-        const page = readPage(wikiRoot, relPath)!;
+        const page = readPage(wikiRoot, relPath);
+        if (!page) throw new Error(`Post-write read failed for ${relPath}`);
+
         const operationId = ulid();
         const op: Operation = {
           id: operationId,
-          created_at: new Date().toISOString(),
+          created_at: now,
           source,
           action: exists ? "update" : "create",
           paths: [relPath],
-          metadata: {
-            oldHash: exists ? readFileAtomic(absPath).hash : null,
-            newHash: page.hash,
-          },
+          metadata: { oldHash, newHash: page.hash },
           parent_id: null,
         };
-        insertOperation(db, op);
-        upsertPageCache(db, page);
-
-        // The watcher will also record this as external-ish; we pre-empt with source info
-        const change: ChangeEvent = {
-          type: "change",
-          data: {
-            id: ulid(),
-            rel_path: relPath,
-            change_type: exists ? "modified" : "created",
-            old_hash: op.metadata?.oldHash as string | null,
-            new_hash: page.hash,
-            source: "api",
-            operation_id: operationId,
-            detected_at: op.created_at,
-          },
-        };
-        insertChange(db, change.data);
+        await store.insertOperation(op);
+        await pipeline.handleFileChange(relPath, {
+          source: "api",
+          operationId,
+        });
 
         return { success: true, page, operationId };
       });
@@ -131,36 +146,55 @@ export function createPageService(
           return { success: false, conflict: { hash, content } };
         }
 
-        const { unlinkSync } = await import("node:fs");
         unlinkSync(absPath);
 
+        const now = new Date().toISOString();
         const operationId = ulid();
         const op: Operation = {
           id: operationId,
-          created_at: new Date().toISOString(),
+          created_at: now,
           source,
           action: "delete",
           paths: [normalized],
           metadata: { oldHash: hash },
           parent_id: null,
         };
-        insertOperation(db, op);
-        // page cache and change row will be handled by watcher; we can also do it eagerly
-        const { deletePageCache } = await import("../db/client.js");
-        deletePageCache(db, normalized);
-        insertChange(db, {
-          id: ulid(),
-          rel_path: normalized,
-          change_type: "deleted",
-          old_hash: hash,
-          new_hash: null,
+        await store.insertOperation(op);
+        await pipeline.handleFileChange(normalized, {
           source: "api",
-          operation_id: operationId,
-          detected_at: op.created_at,
+          operationId,
         });
 
         return { success: true, operationId };
       });
     },
+  };
+}
+
+function documentToPageSummary(doc: {
+  rel_path: string;
+  title: string | null;
+  summary: string | null;
+  frontmatter: Record<string, unknown>;
+  word_count: number;
+  outgoing_links: string[];
+  hash: string;
+  mtime: number;
+  updated_at: string | null;
+  updated_by: string | null;
+}): Page {
+  return {
+    rel_path: doc.rel_path,
+    abs_path: "",
+    title: doc.title,
+    summary: doc.summary,
+    frontmatter: doc.frontmatter,
+    body: "",
+    word_count: doc.word_count,
+    outgoing_links: doc.outgoing_links,
+    hash: doc.hash,
+    mtime: doc.mtime,
+    updated_at: doc.updated_at,
+    updated_by: doc.updated_by,
   };
 }
