@@ -26,6 +26,7 @@ function makeEnv(over: Record<string, string | undefined>): TestEnv {
     PORT: "0",
     HOST: "127.0.0.1",
     PUBLIC_READ: "true",
+    DB_BACKEND: "sqlite",
     DB_PATH: path.join(root, "test.db"),
     LOG_LEVEL: "error",
     ...over,
@@ -168,6 +169,7 @@ describe("agent control: bootstrap, settings, keys", () => {
     const env = makeEnv({
       API_KEYS: "admin:adminkey:*:admin",
       PUBLIC_READ: "true",
+      DB_BACKEND: "sqlite",
     });
     track(env);
     const { hono, store } = await buildApp();

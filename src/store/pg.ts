@@ -2,6 +2,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import postgres, { type Sql } from "postgres";
 import { ulid } from "ulidx";
+import { ftsQuery } from "./fts.js";
 import type { ChangeEvent, Operation } from "../types/index.js";
 import {
   TRUST_ORDER,
@@ -59,13 +60,10 @@ function num(v: unknown): number {
 }
 
 function json<T>(v: unknown, fallback: T): T {
+  // jsonb columns arrive from the driver already parsed; null/undefined means
+  // SQL NULL, which maps to the caller's fallback.
   if (v === null || v === undefined) return fallback;
-  if (typeof v !== "string") return v as T; // jsonb arrives parsed
-  try {
-    return JSON.parse(v) as T;
-  } catch {
-    return fallback;
-  }
+  return v as T;
 }
 
 /** Postgres DDL, one statement per entry. Vector dims are fixed at migrate time. */
@@ -533,6 +531,8 @@ export class PostgresStore implements Store {
     opts: { limit: number; filters?: SearchFilters },
   ): Promise<ChunkHit[]> {
     const [where, params] = filterClause(opts.filters, 1);
+    const match = ftsQuery(q);
+    if (!match) return [];
     const rows = await unsafeQuery(
       this.sql,
       `SELECT ${HIT_COLUMNS}, ts_rank(c.tsv, query) AS score
@@ -542,7 +542,7 @@ export class PostgresStore implements Store {
        WHERE c.tsv @@ query${where}
        ORDER BY score DESC
        LIMIT $${params.length + 2}`,
-      [q, ...params, opts.limit],
+      [match, ...params, opts.limit],
     );
     return (rows as Row[]).map(rowToHit);
   }
@@ -750,9 +750,15 @@ export class PostgresStore implements Store {
     await this.sql`DELETE FROM documents WHERE origin = ${origin}`;
   }
 
-  async resetEmbeddings(): Promise<void> {
+  async resetEmbeddings(dims?: number): Promise<void> {
     await this.sql`DELETE FROM embeddings`;
     await this.sql`UPDATE chunks SET embedded_at = NULL, embed_model = NULL`;
+    if (dims && Number.isInteger(dims)) {
+      // validated int from settings; safe to interpolate into DDL
+      await this.sql.unsafe(
+        `ALTER TABLE embeddings ALTER COLUMN embedding TYPE vector(${dims})`,
+      );
+    }
   }
   // -- Settings ---------------------------------------------------------------
 

@@ -96,10 +96,10 @@ export class SearchService {
     });
 
     let vectorHits: ChunkHit[] = [];
-    const llm = this.flags.llm();
-    if (llm?.embedModel && this.store.supportsVector()) {
+    const embedder = this.flags.embedder();
+    if (embedder && this.store.supportsVector()) {
       try {
-        const [vector] = await llm.embed([opts.q]);
+        const [vector] = await embedder.embed([opts.q]);
         vectorHits = await this.store.searchVector(vector, {
           limit: candidateDepth,
           filters: opts.filters,

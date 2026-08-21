@@ -184,8 +184,8 @@ export class IndexPipeline {
       .filter((t) => t.length > 0 && t !== record.rel_path);
     await this.store.replaceEdges(record.rel_path, edgeTargets);
 
-    const embedModel = this.flags.llm()?.embedModel ?? null;
-    if (embedModel && chunks.length > 0) {
+    const embedder = this.flags.embedder();
+    if (embedder && chunks.length > 0) {
       this.enqueueEmbed(record.id);
     }
   }
@@ -258,13 +258,12 @@ export class IndexPipeline {
   }
 
   private async embedDocument(documentId: string): Promise<void> {
-    const llm = this.flags.llm();
-    const embedModel = llm?.embedModel ?? null;
-    if (!llm || !embedModel) return;
+    const embedder = this.flags.embedder();
+    if (!embedder) return;
     try {
       const chunks = await this.store.getChunksForDocument(documentId);
       if (chunks.length === 0) return;
-      const vectors = await llm.embed(
+      const vectors = await embedder.embed(
         chunks.map((c) => {
           const d = c.distilled;
           const prefix = [d?.question, d?.summary].filter(Boolean).join("\n");
@@ -274,7 +273,7 @@ export class IndexPipeline {
       const embeddedAt = new Date().toISOString();
       await this.store.upsertEmbeddings(
         chunks.map((c, i) => ({ chunkId: c.id, vector: vectors[i] })),
-        embedModel,
+        embedder.model,
         embeddedAt,
       );
     } catch (err) {

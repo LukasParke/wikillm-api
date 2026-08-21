@@ -326,8 +326,9 @@ export interface Store {
 
   // Maintenance
   deleteDerivedForOrigin(origin: string): Promise<void>;
-  /** Drop all embedding vectors and clear embedded flags (dims change). */
-  resetEmbeddings(): Promise<void>;
+  /** Drop all embedding vectors, clear embedded flags, and on Postgres
+   * resize the vector column to the new dimensions. */
+  resetEmbeddings(dims?: number): Promise<void>;
 
   // Runtime settings (key/value overrides persisted across restarts)
   getSettings(): Promise<SettingsMap>;

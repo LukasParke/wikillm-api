@@ -52,12 +52,14 @@ describe("file watcher", () => {
   beforeEach(async () => {
     root = makeRoot();
     process.env.WIKI_ROOT = root;
+    process.env.DB_BACKEND = "sqlite";
     process.env.API_KEYS = "test:key1";
     process.env.DB_PATH = path.join(root, "test.db");
     const config = loadConfig();
     store = await createStore(config);
     pipeline = new IndexPipeline(root, store, {
       llm: () => null,
+      embedder: () => null,
       distillEnabled: async () => false,
     });
     broadcaster = new CollectingBroadcaster();
@@ -65,6 +67,7 @@ describe("file watcher", () => {
 
   afterEach(async () => {
     watcher?.close();
+    delete process.env.DB_BACKEND;
     delete process.env.WIKI_ROOT;
     delete process.env.API_KEYS;
     delete process.env.DB_PATH;

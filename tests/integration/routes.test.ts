@@ -27,6 +27,7 @@ function makeEnv(): {
   process.env.HOST = "127.0.0.1";
   process.env.API_KEYS = "test:key1";
   process.env.PUBLIC_READ = "true";
+  process.env.DB_BACKEND = "sqlite";
   process.env.DB_PATH = dbPath;
 
   const config = loadConfig();
@@ -40,6 +41,7 @@ function makeEnv(): {
       delete process.env.HOST;
       delete process.env.API_KEYS;
       delete process.env.PUBLIC_READ;
+      delete process.env.DB_BACKEND;
       delete process.env.DB_PATH;
     },
   };

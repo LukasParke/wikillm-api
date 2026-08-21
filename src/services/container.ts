@@ -2,6 +2,11 @@ import type { Config } from "../config.js";
 import { createStore } from "../store/index.js";
 import type { Store } from "../store/types.js";
 import { createLlmProviderFromEnv, type LlmProvider } from "../llm/provider.js";
+import {
+  resolveEmbedder,
+  type Embedder,
+  type EmbedderProviderKind,
+} from "../llm/embedder.js";
 import { IndexPipeline } from "./pipeline.js";
 import { SearchService } from "./searchService.js";
 import { QueryService } from "./queryService.js";
@@ -23,6 +28,7 @@ export class LlmHolder {
 /** Live settings getters consumed at request time (never stale). */
 export interface RuntimeFlags {
   llm: () => LlmProvider | null;
+  embedder: () => Embedder | null;
   distillEnabled: () => Promise<boolean>;
 }
 
@@ -71,8 +77,12 @@ export async function createServices(
 
   await settings.warm();
   const llmHolder = new LlmHolder(buildLlm(config, settings));
+  const embedderHolder: { current: Embedder | null } = {
+    current: buildEmbedder(settings),
+  };
   const flags: RuntimeFlags = {
     llm: () => llmHolder.current,
+    embedder: () => embedderHolder.current,
     distillEnabled: async () =>
       (await settings.get<boolean>("llm_distill")) === true,
   };
@@ -93,6 +103,17 @@ export async function createServices(
   const connectors = new ConnectorManager(store, pipeline);
 
   settings.onChange((key, value) => {
+    if (
+      [
+        "embedding_provider",
+        "onnx_model",
+        "onnx_dtype",
+        "onnx_device",
+      ].includes(key)
+    ) {
+      embedderHolder.current = buildEmbedder(settings);
+      console.log(`Embedder rebuilt after settings change: ${key}`);
+    }
     if (
       key === "llm_base_url" ||
       key === "llm_api_key" ||
@@ -122,6 +143,31 @@ export async function createServices(
     projects,
     connectors,
   };
+}
+
+/** Build the embedder from live settings (provider selection). */
+function buildEmbedder(settings: SettingsService): Embedder | null {
+  const cache = settings.cacheSnapshot();
+  const get = (k: string): unknown => cache.get(k)?.value;
+  const providerRaw =
+    (get("embedding_provider") as string | undefined) ?? "auto";
+  let provider = providerRaw as EmbedderProviderKind | "auto";
+  if (provider === "auto") {
+    const baseUrl = (get("llm_base_url") as string | undefined) ?? "";
+    const embedModel = (get("llm_embed_model") as string | undefined) ?? "";
+    provider = baseUrl && embedModel ? "api" : "none";
+  }
+  return resolveEmbedder({
+    getProvider: () => provider,
+    getApiBaseUrl: () => (get("llm_base_url") as string | undefined) ?? "",
+    getApiKey: () => (get("llm_api_key") as string | undefined) ?? "",
+    getApiModel: () => (get("llm_embed_model") as string | undefined) ?? "",
+    getOnnxModel: () =>
+      (get("onnx_model") as string | undefined) ?? "Xenova/bge-small-en-v1.5",
+    getOnnxDtype: () => (get("onnx_dtype") as string | undefined) ?? "q8",
+    getOnnxDevice: () => (get("onnx_device") as string | undefined) ?? "cpu",
+    getDimsFallback: () => Number(get("embedding_dims") ?? 1536),
+  });
 }
 
 /** Build a provider from live settings, falling back to env config. */

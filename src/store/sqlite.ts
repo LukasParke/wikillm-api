@@ -3,6 +3,7 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ulid } from "ulidx";
+import { ftsQuery } from "./fts.js";
 import type { ChangeEvent, Operation } from "../types/index.js";
 import {
   TRUST_ORDER,
@@ -116,17 +117,6 @@ function json<T>(v: unknown, fallback: T): T {
 
 function jstr(value: unknown): string | null {
   return value === undefined || value === null ? null : JSON.stringify(value);
-}
-
-/** Escape a user query into safe FTS5 terms joined with OR (recall-first). */
-export function ftsQuery(q: string): string {
-  const terms = q
-    .split(/\s+/)
-    .map((t) => t.replace(/["'()*:^]/g, " ").trim())
-    .filter((t) => t.length > 0)
-    .slice(0, 12);
-  if (terms.length === 0) return "";
-  return terms.map((t) => `"${t}"`).join(" OR ");
 }
 
 const HIT_COLUMNS = `
@@ -781,7 +771,7 @@ export class SqliteStore implements Store {
 
   // -- Maintenance --------------------------------------------------------------
 
-  resetEmbeddings(): Promise<void> {
+  resetEmbeddings(_dims?: number): Promise<void> {
     this.db.prepare("DELETE FROM embeddings").run();
     this.db
       .prepare("UPDATE chunks SET embedded_at = NULL, embed_model = NULL")

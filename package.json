@@ -28,7 +28,8 @@
   },
   "optionalDependencies": {
     "better-sqlite3": "^12.5.0",
-    "ws": "^8.21.0"
+    "ws": "^8.21.0",
+    "@huggingface/transformers": "^4.2.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
@@ -48,5 +49,9 @@
   "engines": {
     "bun": ">=1.0.0",
     "node": ">=20.0.0"
-  }
+  },
+  "trustedDependencies": [
+    "onnxruntime-node",
+    "protobufjs"
+  ]
 }

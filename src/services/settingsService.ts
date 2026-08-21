@@ -81,6 +81,41 @@ const SETTING_META: SettingMeta[] = [
     validate: z.number().int().min(64).max(4096),
   },
   {
+    key: "embedding_provider",
+    type: "enum",
+    mutable: true,
+    requiresReindex: true,
+    description:
+      "Embedding source: none (FTS-only), api (OpenAI-compatible), onnx (in-process), auto (api if configured else none)",
+    validate: z.enum(["none", "api", "onnx", "auto"]),
+  },
+  {
+    key: "onnx_model",
+    type: "string",
+    mutable: true,
+    requiresReindex: true,
+    description:
+      "Hugging Face model id for the ONNX embedder (e.g. Xenova/bge-small-en-v1.5)",
+    validate: z.string().min(1),
+  },
+  {
+    key: "onnx_dtype",
+    type: "enum",
+    mutable: true,
+    requiresReindex: true,
+    description: "ONNX quantization: q8 (fast, NPU-friendly), fp32, fp16",
+    validate: z.enum(["q8", "fp16", "fp32", "quantized", "auto"]),
+  },
+  {
+    key: "onnx_device",
+    type: "string",
+    mutable: true,
+    requiresReindex: true,
+    description:
+      "ONNX execution target: cpu, webgpu, or platform NPU EP where available",
+    validate: z.string().min(1),
+  },
+  {
     key: "llm_distill",
     type: "bool",
     mutable: true,
@@ -210,6 +245,14 @@ export class SettingsService {
         return this.config.LLM_EMBED_MODEL ?? "";
       case "embedding_dims":
         return this.config.EMBEDDING_DIMS;
+      case "embedding_provider":
+        return (process.env.EMBEDDING_PROVIDER as never) ?? "auto";
+      case "onnx_model":
+        return process.env.ONNX_MODEL ?? "Xenova/bge-small-en-v1.5";
+      case "onnx_dtype":
+        return process.env.ONNX_DTYPE ?? "q8";
+      case "onnx_device":
+        return process.env.ONNX_DEVICE ?? "cpu";
       case "llm_distill":
         return this.config.LLM_DISTILL;
       case "okf_strict":
@@ -325,7 +368,9 @@ export class SettingsService {
       meta.requiresReindex === true &&
       JSON.stringify(previous) !== JSON.stringify(parsed.data);
     if (reindexRequired) {
-      await this.store.resetEmbeddings();
+      await this.store.resetEmbeddings(
+        key === "embedding_dims" ? Number(parsed.data) : undefined,
+      );
     }
     for (const hook of this.hooks) hook(key, parsed.data);
     return { reindexRequired };

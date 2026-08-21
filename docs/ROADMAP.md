@@ -1,11 +1,14 @@
 # WikiLLM API — Roadmap: Unified Self-Hosted Knowledge Base Service
 
 Status: **implemented** (2026-08-21). Phases A–F shipped; see README for the
-current feature set and `docs/openapi.yaml` for the API surface. Deviations
-from the original proposal: SQLite deployments run FTS-only retrieval (no
-local ONNX embedder); GitHub connector covers issues/PRs/releases (discussions
-deferred); the separate IDF retrieval pass is folded into BM25/ts_rank scoring,
-which already encodes term rarity.
+current feature set and `docs/openapi.yaml` for the API surface. Update (2026-08-21, later): an in-process ONNX embedder
+(transformers.js/onnxruntime-node, default `Xenova/bge-small-en-v1.5` q8, 384
+dims) is now shipped as `embedding_provider=onnx`, so semantic search no longer
+requires an external API; on AMD Ryzen AI (Strix Halo) machines the underlying
+onnxruntime can target NPU execution providers where the platform exposes them.
+Remaining deviations from the original proposal: GitHub connector covers
+issues/PRs/releases (discussions deferred); the separate IDF retrieval pass is
+folded into BM25/ts_rank scoring, which already encodes term rarity.
 
 ## 1. Vision
 
