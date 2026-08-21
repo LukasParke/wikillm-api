@@ -56,7 +56,10 @@ describe("file watcher", () => {
     process.env.DB_PATH = path.join(root, "test.db");
     const config = loadConfig();
     store = await createStore(config);
-    pipeline = new IndexPipeline(root, store, null);
+    pipeline = new IndexPipeline(root, store, {
+      llm: () => null,
+      distillEnabled: async () => false,
+    });
     broadcaster = new CollectingBroadcaster();
   });
 

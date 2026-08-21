@@ -188,6 +188,30 @@ export interface StatsOverview {
   feedback_total: number;
 }
 
+export interface ApiKeyRecord {
+  name: string;
+  /** sha256 hex of the bearer secret; plaintext never stored */
+  key_hash: string;
+  /** first 6 chars of the secret for identification */
+  key_prefix: string;
+  scope: string[];
+  role: "admin" | "write" | "read";
+  created_at: string;
+  updated_at: string;
+  created_by: string;
+}
+
+export interface ApiKeyUpsert {
+  name: string;
+  key_hash: string;
+  key_prefix: string;
+  scope: string[];
+  role: "admin" | "write" | "read";
+  created_by: string;
+}
+
+export type SettingsMap = Record<string, unknown>;
+
 // ---------------------------------------------------------------------------
 // Store interface — the single persistence contract.
 // All methods async so SQLite and Postgres implementations are interchangeable.
@@ -302,4 +326,19 @@ export interface Store {
 
   // Maintenance
   deleteDerivedForOrigin(origin: string): Promise<void>;
+  /** Drop all embedding vectors and clear embedded flags (dims change). */
+  resetEmbeddings(): Promise<void>;
+
+  // Runtime settings (key/value overrides persisted across restarts)
+  getSettings(): Promise<SettingsMap>;
+  setSetting(key: string, value: unknown, updatedBy: string): Promise<void>;
+  deleteSetting(key: string): Promise<boolean>;
+
+  // API keys (hashed; env keys are merged at the auth layer)
+  listApiKeys(): Promise<ApiKeyRecord[]>;
+  getApiKey(name: string): Promise<ApiKeyRecord | null>;
+  findApiKeyByHash(keyHash: string): Promise<ApiKeyRecord | null>;
+  upsertApiKey(input: ApiKeyUpsert): Promise<void>;
+  deleteApiKey(name: string): Promise<boolean>;
+  countApiKeys(): Promise<number>;
 }

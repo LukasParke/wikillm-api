@@ -17,6 +17,9 @@ import pages from "./routes/pages.js";
 import search from "./routes/search.js";
 import sources from "./routes/sources.js";
 import wsRoute from "./routes/ws.js";
+import rootRoute from "./routes/root.js";
+import settingsRoute from "./routes/settings.js";
+import keysRoute from "./routes/keys.js";
 import queryRoute from "./routes/query.js";
 import graphRoute from "./routes/graph.js";
 import okfRoute from "./routes/okf.js";
@@ -77,11 +80,22 @@ export function createApp({
     );
   });
 
-  app.use("*", rateLimitMiddleware(config.RATE_LIMIT_RPM));
-  app.use("*", authMiddleware(config.API_KEYS, config.PUBLIC_READ));
+  const publicRead = async (): Promise<boolean> =>
+    (await services.settings.get<boolean>("public_read")) ?? config.PUBLIC_READ;
+  const rateLimitRpm = async (): Promise<number> =>
+    (await services.settings.get<number>("rate_limit_rpm")) ??
+    config.RATE_LIMIT_RPM;
+  app.use("*", rateLimitMiddleware(rateLimitRpm));
+  app.use(
+    "*",
+    authMiddleware(services.keys, () => publicRead()),
+  );
 
   app.route("/health", health);
   app.route("/metrics", metricsRoute);
+  app.route("/v1", rootRoute);
+  app.route("/v1/settings", settingsRoute);
+  app.route("/v1/keys", keysRoute);
   app.route("/v1/pages", pages);
   app.route("/v1/sources", sources);
   app.route("/v1/index", indexRoute);

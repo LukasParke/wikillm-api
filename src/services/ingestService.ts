@@ -6,6 +6,7 @@ import type { ServiceDeps } from "./pageService.js";
 import { actorFromSource } from "../okf/trust.js";
 import { parseHumanActors } from "./pageService.js";
 import { appendLogEntry, writeIndexFile } from "./bundleFiles.js";
+import { enforceOkfStrict } from "./pageService.js";
 import { atomicWrite, readFileAtomic } from "../fs/atomic.js";
 import { pathLock } from "../fs/lock.js";
 import { normalizeRelPath, resolveWikiPath } from "../fs/paths.js";
@@ -30,9 +31,13 @@ export interface IngestResult {
 }
 
 export function createIngestService(deps: ServiceDeps, source: Source) {
-  const { config, store, pipeline } = deps;
+  const { config, store, pipeline, settings } = deps;
   const wikiRoot = config.WIKI_ROOT;
-  const actor = actorFromSource(source, parseHumanActors(config.HUMAN_ACTORS));
+  const actorFor = async (): Promise<string> =>
+    actorFromSource(
+      source,
+      parseHumanActors(await settings.get<string>("human_actors")),
+    );
 
   return {
     async run(input: IngestInput): Promise<IngestResult> {
@@ -105,10 +110,13 @@ export function createIngestService(deps: ServiceDeps, source: Source) {
           ensureParentDir(abs);
           const existed = existsSync(abs);
 
+          await enforceOkfStrict(settings, wikiRoot, op.frontmatter ?? {});
           const fm: Record<string, unknown> = { ...(op.frontmatter ?? {}) };
           if (!("updated_at" in fm)) fm.updated_at = now;
           if (!("updated_by" in fm)) fm.updated_by = source;
-          if (!("generated" in fm)) fm.generated = { by: actor, at: now };
+          if (!("generated" in fm)) {
+            fm.generated = { by: await actorFor(), at: now };
+          }
 
           atomicWrite(abs, matter.stringify(op.content, fm));
           await pipeline.handleFileChange(rel, {

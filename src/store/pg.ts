@@ -5,6 +5,9 @@ import { ulid } from "ulidx";
 import type { ChangeEvent, Operation } from "../types/index.js";
 import {
   TRUST_ORDER,
+  type ApiKeyRecord,
+  type ApiKeyUpsert,
+  type SettingsMap,
   type ChunkHit,
   type ChunkInput,
   type ChunkRecord,
@@ -189,6 +192,22 @@ export function pgSchemaStatements(dims: number): string[] {
        error TEXT
      )`,
     `CREATE INDEX IF NOT EXISTS idx_queries_created ON queries(created_at)`,
+    `CREATE TABLE IF NOT EXISTS settings (
+       key TEXT PRIMARY KEY,
+       value JSONB NOT NULL,
+       updated_at TEXT NOT NULL,
+       updated_by TEXT
+     )`,
+    `CREATE TABLE IF NOT EXISTS api_keys (
+       name TEXT PRIMARY KEY,
+       key_hash TEXT NOT NULL UNIQUE,
+       key_prefix TEXT NOT NULL,
+       scope JSONB NOT NULL DEFAULT '["*"]',
+       role TEXT NOT NULL DEFAULT 'write',
+       created_at TEXT NOT NULL,
+       updated_at TEXT NOT NULL,
+       created_by TEXT
+     )`,
     `CREATE TABLE IF NOT EXISTS feedback (
        id TEXT PRIMARY KEY,
        query_id TEXT NOT NULL,
@@ -730,6 +749,77 @@ export class PostgresStore implements Store {
   async deleteDerivedForOrigin(origin: string): Promise<void> {
     await this.sql`DELETE FROM documents WHERE origin = ${origin}`;
   }
+
+  async resetEmbeddings(): Promise<void> {
+    await this.sql`DELETE FROM embeddings`;
+    await this.sql`UPDATE chunks SET embedded_at = NULL, embed_model = NULL`;
+  }
+  // -- Settings ---------------------------------------------------------------
+
+  async getSettings(): Promise<SettingsMap> {
+    const rows = await this.sql`SELECT key, value FROM settings`;
+    const out: SettingsMap = {};
+    for (const row of rows as Row[]) out[s(row.key)!] = json(row.value, null);
+    return out;
+  }
+
+  async setSetting(
+    key: string,
+    value: unknown,
+    updatedBy: string,
+  ): Promise<void> {
+    await this.sql`
+      INSERT INTO settings (key, value, updated_at, updated_by)
+      VALUES (${key}, ${this.sql.json(value as never)}, ${new Date().toISOString()}, ${updatedBy})
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value,
+        updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by`;
+  }
+
+  async deleteSetting(key: string): Promise<boolean> {
+    const rows = await this
+      .sql`DELETE FROM settings WHERE key = ${key} RETURNING key`;
+    return rows.length > 0;
+  }
+
+  // -- API keys ---------------------------------------------------------------
+
+  async listApiKeys(): Promise<ApiKeyRecord[]> {
+    const rows = await this.sql`SELECT * FROM api_keys ORDER BY name`;
+    return (rows as Row[]).map(rowToApiKey);
+  }
+
+  async getApiKey(name: string): Promise<ApiKeyRecord | null> {
+    const rows = await this.sql`SELECT * FROM api_keys WHERE name = ${name}`;
+    return rows.length ? rowToApiKey(rows[0] as Row) : null;
+  }
+
+  async findApiKeyByHash(keyHash: string): Promise<ApiKeyRecord | null> {
+    const rows = await this
+      .sql`SELECT * FROM api_keys WHERE key_hash = ${keyHash}`;
+    return rows.length ? rowToApiKey(rows[0] as Row) : null;
+  }
+
+  async upsertApiKey(input: ApiKeyUpsert): Promise<void> {
+    const now = new Date().toISOString();
+    await this.sql`
+      INSERT INTO api_keys (name, key_hash, key_prefix, scope, role, created_at, updated_at, created_by)
+      VALUES (${input.name}, ${input.key_hash}, ${input.key_prefix},
+              ${this.sql.json(input.scope)}, ${input.role}, ${now}, ${now}, ${input.created_by})
+      ON CONFLICT (name) DO UPDATE SET key_hash = EXCLUDED.key_hash,
+        key_prefix = EXCLUDED.key_prefix, scope = EXCLUDED.scope, role = EXCLUDED.role,
+        updated_at = EXCLUDED.updated_at, created_by = EXCLUDED.created_by`;
+  }
+
+  async deleteApiKey(name: string): Promise<boolean> {
+    const rows = await this
+      .sql`DELETE FROM api_keys WHERE name = ${name} RETURNING name`;
+    return rows.length > 0;
+  }
+
+  async countApiKeys(): Promise<number> {
+    const [row] = await this.sql`SELECT COUNT(*)::int AS n FROM api_keys`;
+    return num((row as Row).n);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -787,6 +877,19 @@ function rowToConnector(row: Row): ConnectorConfig {
     enabled: row.enabled === true,
     created_at: s(row.created_at)!,
     updated_at: s(row.updated_at)!,
+  };
+}
+
+function rowToApiKey(row: Row): ApiKeyRecord {
+  return {
+    name: s(row.name)!,
+    key_hash: s(row.key_hash)!,
+    key_prefix: s(row.key_prefix)!,
+    scope: json<string[]>(row.scope, ["*"]),
+    role: s(row.role) as ApiKeyRecord["role"],
+    created_at: s(row.created_at)!,
+    updated_at: s(row.updated_at)!,
+    created_by: s(row.created_by)!,
   };
 }
 

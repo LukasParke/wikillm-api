@@ -1,7 +1,7 @@
 import { ulid } from "ulidx";
 import type { SearchFilters, Store } from "../store/types.js";
 import { LlmNotConfiguredError, type SearchService } from "./searchService.js";
-import type { LlmProvider } from "../llm/provider.js";
+import type { RuntimeFlags } from "./container.js";
 
 export interface QueryAnswer {
   answer: string;
@@ -54,7 +54,7 @@ const KNOWN_TOOLS = new Set([
 export class QueryService {
   constructor(
     private readonly store: Store,
-    private readonly llm: LlmProvider | null,
+    private readonly flags: RuntimeFlags,
     private readonly search: SearchService,
   ) {}
 
@@ -63,7 +63,7 @@ export class QueryService {
     filters?: SearchFilters;
     source?: string | null;
   }): Promise<QueryAnswer> {
-    const llm = this.llm;
+    const llm = this.flags.llm();
     if (!llm) throw new LlmNotConfiguredError();
     const started = Date.now();
 

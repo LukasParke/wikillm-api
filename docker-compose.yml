@@ -7,6 +7,7 @@ services:
     environment:
       - WIKI_ROOT=/wiki
       - API_KEYS=${API_KEYS}
+      - BOOTSTRAP_ADMIN_KEY=${BOOTSTRAP_ADMIN_KEY:-}
       - PUBLIC_READ=${PUBLIC_READ:-true}
       # Index backend: postgres (default when DATABASE_URL set) or sqlite
       - DB_BACKEND=${DB_BACKEND:-postgres}

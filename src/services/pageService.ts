@@ -1,4 +1,4 @@
-import { existsSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import matter from "gray-matter";
 import { ulid } from "ulidx";
@@ -10,6 +10,8 @@ import { ensureParentDir, readPage } from "../fs/wiki.js";
 import { actorFromSource } from "../okf/trust.js";
 import type { Store } from "../store/types.js";
 import type { IndexPipeline } from "./pipeline.js";
+import type { SettingsService } from "./settingsService.js";
+import { OkfStrictError } from "./settingsService.js";
 import type { Operation, Page, Source } from "../types/index.js";
 
 export interface PageWriteInput {
@@ -30,6 +32,28 @@ export interface ServiceDeps {
   config: Config;
   store: Store;
   pipeline: IndexPipeline;
+  settings: SettingsService;
+}
+
+/**
+ * OKF strict mode: when enabled AND the bundle declares okf_version, every
+ * concept write must carry a non-empty frontmatter type.
+ */
+export async function enforceOkfStrict(
+  settings: SettingsService,
+  wikiRoot: string,
+  frontmatter: Record<string, unknown>,
+): Promise<void> {
+  const strict = await settings.get<boolean>("okf_strict");
+  if (!strict) return;
+  const rootIndex = path.join(wikiRoot, "index.md");
+  if (!existsSync(rootIndex)) return;
+  const raw = readFileSync(rootIndex, "utf8");
+  if (!raw.includes("okf_version")) return;
+  const type = frontmatter.type;
+  if (typeof type !== "string" || type.trim() === "") {
+    throw new OkfStrictError();
+  }
 }
 
 export function parseHumanActors(raw: string | undefined): Set<string> {
@@ -54,9 +78,13 @@ export function createPageService(
   write(input: PageWriteInput): Promise<PageWriteResult>;
   delete(relPath: string, ifMatch?: string): Promise<PageWriteResult>;
 } {
-  const { config, store, pipeline } = deps;
+  const { config, store, pipeline, settings } = deps;
   const wikiRoot = config.WIKI_ROOT;
-  const actor = actorFromSource(source, parseHumanActors(config.HUMAN_ACTORS));
+  const actorFor = async (): Promise<string> =>
+    actorFromSource(
+      source,
+      parseHumanActors(await settings.get<string>("human_actors")),
+    );
 
   return {
     async get(relPath: string): Promise<Page | null> {
@@ -103,10 +131,13 @@ export function createPageService(
         const oldHash = exists ? readFileAtomic(absPath).hash : null;
 
         const now = new Date().toISOString();
+        await enforceOkfStrict(settings, wikiRoot, input.frontmatter ?? {});
         const fm: Record<string, unknown> = { ...(input.frontmatter ?? {}) };
         if (!("updated_at" in fm)) fm.updated_at = now;
         if (!("updated_by" in fm)) fm.updated_by = source;
-        if (!("generated" in fm)) fm.generated = { by: actor, at: now };
+        if (!("generated" in fm)) {
+          fm.generated = { by: await actorFor(), at: now };
+        }
 
         atomicWrite(absPath, matter.stringify(input.content, fm));
 

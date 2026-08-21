@@ -210,9 +210,7 @@ describe.each(backends)("store backend: %s", (name, factory) => {
 
   it("supports vector search where the backend can", async () => {
     if (!store.supportsVector()) return; // SQLite is FTS-only by design
-    await store.upsertDocument(
-      sampleDoc({ rel_path: "wiki/vec/target.md" }),
-    );
+    await store.upsertDocument(sampleDoc({ rel_path: "wiki/vec/target.md" }));
     const doc = await store.getDocument("wiki/vec/target.md");
     await store.replaceChunks(doc!.id, [
       { ordinal: 0, heading_path: null, content: "semantic target chunk" },

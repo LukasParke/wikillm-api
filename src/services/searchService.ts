@@ -1,7 +1,7 @@
 import type { Store } from "../store/types.js";
 import type { ChunkHit, SearchFilters } from "../store/types.js";
 import { deriveTrustTier } from "../okf/trust.js";
-import type { LlmProvider } from "../llm/provider.js";
+import type { RuntimeFlags } from "./container.js";
 
 export interface SearchHit {
   rel_path: string;
@@ -82,7 +82,7 @@ const RERANK_PROMPT = [
 export class SearchService {
   constructor(
     private readonly store: Store,
-    private readonly llm: LlmProvider | null,
+    private readonly flags: RuntimeFlags,
   ) {}
 
   async search(opts: SearchOptions): Promise<SearchResult> {
@@ -96,7 +96,7 @@ export class SearchService {
     });
 
     let vectorHits: ChunkHit[] = [];
-    const llm = this.llm;
+    const llm = this.flags.llm();
     if (llm?.embedModel && this.store.supportsVector()) {
       try {
         const [vector] = await llm.embed([opts.q]);
@@ -156,7 +156,7 @@ export class SearchService {
     candidates: Array<{ hit: ChunkHit; score: number }>,
     enabled: boolean,
   ): Promise<Array<{ hit: ChunkHit; score: number }>> {
-    const llm = this.llm;
+    const llm = this.flags.llm();
     if (!enabled || !llm || candidates.length < 2) return candidates;
     const shortlist = candidates.slice(0, 20);
     try {

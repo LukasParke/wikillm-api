@@ -8,14 +8,16 @@ interface Bucket {
 
 /**
  * Fixed-window per-identity rate limiter. Identity = bearer key name when
- * authenticated, else client IP. RATE_LIMIT_RPM=0 disables limiting.
+ * authenticated, else client IP. The limit is read live each request so the
+ * runtime setting applies without restart; 0 disables limiting.
  */
-export function rateLimitMiddleware(requestsPerMinute: number) {
+export function rateLimitMiddleware(getRpm: () => number | Promise<number>) {
   const buckets = new Map<string, Bucket>();
   return createMiddleware(async (c: Context, next: Next) => {
-    if (requestsPerMinute <= 0) return next();
+    const requestsPerMinute = await getRpm();
+    if (!requestsPerMinute || requestsPerMinute <= 0) return next();
     const identity =
-      c.get("auth")?.name ?? c.req.header("x-forwarded-for") ?? "ip unknown";
+      c.get("auth")?.name ?? c.req.header("x-forwarded-for") ?? "unknown-ip";
     const now = Date.now();
     const bucket = buckets.get(identity);
     if (!bucket || now - bucket.windowStart >= 60_000) {

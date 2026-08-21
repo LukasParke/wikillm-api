@@ -334,4 +334,498 @@ export function registerTools(server: McpServer): void {
     async () =>
       run(async () => JSON.stringify(await api("/v1/index/refresh"), null, 2)),
   );
+
+  server.registerTool(
+    "settings_list",
+    {
+      description:
+        "List all WikiLLM settings with type, default, current value, and override state. Secret values are masked.",
+      inputSchema: {},
+    },
+    async () =>
+      run(async () => {
+        const data = (await api("/v1/settings")) as Record<string, unknown>;
+        const settings = Array.isArray(data["settings"])
+          ? (data["settings"] as Record<string, unknown>[])
+          : [];
+        if (settings.length === 0) return "No settings found.";
+        return settings
+          .map((s) => {
+            const key = String(s["key"] ?? "(unknown)");
+            const type = String(s["type"] ?? "?");
+            const isSecret =
+              s["value"] === undefined ||
+              s["value"] === null ||
+              (typeof s["value"] === "string" &&
+                /^\*+$/.test(s["value"] as string));
+            const value = isSecret ? "<masked>" : JSON.stringify(s["value"]);
+            const def = JSON.stringify(s["default"]);
+            const overridden = s["overridden"] ? ", overridden" : "";
+            return `${key} (${type}, default=${def}, value=${value}${overridden})`;
+          })
+          .join("\n");
+      }),
+  );
+  server.registerTool(
+    "settings_get",
+    {
+      description: "Fetch a single setting view by key.",
+      inputSchema: { key: z.string().describe("Setting key") },
+    },
+    async ({ key }) =>
+      run(async () =>
+        JSON.stringify(
+          await api(`/v1/settings/${encodeURIComponent(key)}`),
+          null,
+          2,
+        ),
+      ),
+  );
+
+  server.registerTool(
+    "settings_set",
+    {
+      description:
+        "Set a setting value. Value may be a string, number, boolean, array, or object; it is sent as-is. Notes when a reindex is required.",
+      inputSchema: {
+        key: z.string().describe("Setting key"),
+        value: z
+          .union([
+            z.string(),
+            z.number(),
+            z.boolean(),
+            z.array(z.unknown()),
+            z.record(z.unknown()),
+          ])
+          .describe("New value"),
+      },
+    },
+    async ({ key, value }) =>
+      run(async () => {
+        const result = await api(`/v1/settings/${encodeURIComponent(key)}`, {
+          method: "PUT",
+          body: JSON.stringify({ value }),
+        });
+        const record = result as Record<string, unknown>;
+        if (record["reindex_required"] === true)
+          return `Set ${key}.\nNOTE: reindex required for this change to take effect — call admin_reindex.`;
+        return `Set ${key}.\n${JSON.stringify(result, null, 2)}`;
+      }),
+  );
+
+  server.registerTool(
+    "settings_reset",
+    {
+      description: "Reset a setting back to its env/default value.",
+      inputSchema: { key: z.string().describe("Setting key") },
+    },
+    async ({ key }) =>
+      run(
+        async () =>
+          `Reset ${key}.\n${JSON.stringify(
+            await api(`/v1/settings/${encodeURIComponent(key)}`, {
+              method: "DELETE",
+            }),
+            null,
+            2,
+          )}`,
+      ),
+  );
+
+  server.registerTool(
+    "keys_list",
+    {
+      description:
+        "List API keys (prefix only — plaintext keys are never returned after creation).",
+      inputSchema: {},
+    },
+    async () =>
+      run(async () => {
+        const data = (await api("/v1/keys")) as Record<string, unknown>;
+        const keys = Array.isArray(data["keys"])
+          ? (data["keys"] as Record<string, unknown>[])
+          : [];
+        if (keys.length === 0) return "No API keys.";
+        return keys
+          .map((k) =>
+            [
+              String(k["name"] ?? "(unnamed)"),
+              String(k["key_prefix"] ?? ""),
+              `role=${String(k["role"] ?? "?")}`,
+              `scope=${JSON.stringify(k["scope"])}`,
+              k["created_at"] !== undefined
+                ? `created=${String(k["created_at"])}`
+                : "",
+              k["created_by"] !== undefined
+                ? `by=${String(k["created_by"])}`
+                : "",
+            ]
+              .filter(Boolean)
+              .join(" "),
+          )
+          .join("\n");
+      }),
+  );
+
+  server.registerTool(
+    "key_create",
+    {
+      description:
+        "Create an API key. The plaintext key is shown ONCE in the output — store it immediately.",
+      inputSchema: {
+        name: z.string().optional(),
+        role: z.enum(["admin", "write", "read"]).default("write").optional(),
+        scope: z.array(z.string()).default(["*"]).optional(),
+      },
+    },
+    async ({ name, role, scope }) =>
+      run(async () => {
+        const body: Record<string, unknown> = {};
+        if (name !== undefined) body["name"] = name;
+        if (role !== undefined) body["role"] = role;
+        if (scope !== undefined) body["scope"] = scope;
+        const result = await api("/v1/keys", {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+        const record = result as Record<string, unknown>;
+        return [
+          "WARNING: this plaintext key is shown ONLY once — save it now.",
+          `key: ${String(record["key"] ?? "(missing)")}`,
+          `prefix: ${String(record["key_prefix"] ?? "")}`,
+          `role: ${String(record["role"] ?? "")}`,
+          `scope: ${JSON.stringify(record["scope"])}`,
+        ].join("\n");
+      }),
+  );
+
+  server.registerTool(
+    "key_delete",
+    {
+      description: "Delete an API key by name.",
+      inputSchema: { name: z.string().describe("Key name") },
+    },
+    async ({ name }) =>
+      run(async () =>
+        JSON.stringify(
+          await api(`/v1/keys/${encodeURIComponent(name)}`, {
+            method: "DELETE",
+          }),
+          null,
+          2,
+        ),
+      ),
+  );
+
+  server.registerTool(
+    "projects_list",
+    {
+      description: "List configured wiki projects.",
+      inputSchema: {},
+    },
+    async () =>
+      run(async () => JSON.stringify(await api("/v1/projects"), null, 2)),
+  );
+
+  server.registerTool(
+    "project_put",
+    {
+      description: "Create or update a project (path prefixes are required).",
+      inputSchema: {
+        name: z.string().describe("Project name"),
+        prefixes: z
+          .array(z.string())
+          .min(1)
+          .describe("Path prefixes served by this project"),
+        description: z.string().optional(),
+        connectors: z.array(z.string()).optional(),
+      },
+    },
+    async ({ name, prefixes, description, connectors }) =>
+      run(async () => {
+        const body: Record<string, unknown> = { prefixes };
+        if (description !== undefined) body["description"] = description;
+        if (connectors !== undefined) body["connectors"] = connectors;
+        return JSON.stringify(
+          await api(`/v1/projects/${encodeURIComponent(name)}`, {
+            method: "PUT",
+            body: JSON.stringify(body),
+          }),
+          null,
+          2,
+        );
+      }),
+  );
+
+  server.registerTool(
+    "project_delete",
+    {
+      description: "Delete a project by name.",
+      inputSchema: { name: z.string().describe("Project name") },
+    },
+    async ({ name }) =>
+      run(async () =>
+        JSON.stringify(
+          await api(`/v1/projects/${encodeURIComponent(name)}`, {
+            method: "DELETE",
+          }),
+          null,
+          2,
+        ),
+      ),
+  );
+
+  server.registerTool(
+    "connectors_list",
+    {
+      description: "List configured connectors (admin).",
+      inputSchema: {},
+    },
+    async () =>
+      run(async () => JSON.stringify(await api("/v1/connectors"), null, 2)),
+  );
+
+  server.registerTool(
+    "connector_create",
+    {
+      description: "Create a connector of kind git, web, or github.",
+      inputSchema: {
+        kind: z.enum(["git", "web", "github"]),
+        config: z
+          .record(z.unknown())
+          .describe("Connector-specific configuration"),
+        id: z.string().optional(),
+        enabled: z.boolean().optional(),
+      },
+    },
+    async ({ kind, config, id, enabled }) =>
+      run(async () => {
+        const body: Record<string, unknown> = { kind, config };
+        if (id !== undefined) body["id"] = id;
+        if (enabled !== undefined) body["enabled"] = enabled;
+        return JSON.stringify(
+          await api("/v1/connectors", {
+            method: "POST",
+            body: JSON.stringify(body),
+          }),
+          null,
+          2,
+        );
+      }),
+  );
+
+  server.registerTool(
+    "connector_delete",
+    {
+      description: "Delete a connector by id.",
+      inputSchema: { id: z.string().describe("Connector id") },
+    },
+    async ({ id }) =>
+      run(async () =>
+        JSON.stringify(
+          await api(`/v1/connectors/${encodeURIComponent(id)}`, {
+            method: "DELETE",
+          }),
+          null,
+          2,
+        ),
+      ),
+  );
+
+  server.registerTool(
+    "connector_run",
+    {
+      description:
+        "Trigger a connector run and report how many documents were ingested.",
+      inputSchema: { id: z.string().describe("Connector id") },
+    },
+    async ({ id }) =>
+      run(async () => {
+        const result = await api(
+          `/v1/connectors/${encodeURIComponent(id)}/run`,
+          {
+            method: "POST",
+          },
+        );
+        const record = result as Record<string, unknown>;
+        if (Array.isArray(record["docs"]))
+          return `Ingested ${record["docs"].length} document(s).\n${JSON.stringify(result, null, 2)}`;
+        return JSON.stringify(result, null, 2);
+      }),
+  );
+
+  server.registerTool(
+    "admin_reindex",
+    {
+      description: "Trigger a full administrative reindex.",
+      inputSchema: {},
+    },
+    async () =>
+      run(async () =>
+        JSON.stringify(
+          await api("/v1/admin/reindex", { method: "POST" }),
+          null,
+          2,
+        ),
+      ),
+  );
+
+  server.registerTool(
+    "admin_stats",
+    {
+      description:
+        "Get an overview of index/document counts and other admin stats.",
+      inputSchema: {},
+    },
+    async () =>
+      run(async () => {
+        const stats = (await api("/v1/admin/stats")) as Record<string, unknown>;
+        const lines: string[] = [];
+        for (const [key, value] of Object.entries(stats)) {
+          if (
+            value !== null &&
+            typeof value === "object" &&
+            !Array.isArray(value)
+          ) {
+            for (const [k, v] of Object.entries(
+              value as Record<string, unknown>,
+            ))
+              lines.push(`${key}.${k}: ${String(v)}`);
+          } else {
+            lines.push(
+              `${key}: ${Array.isArray(value) ? value.length : String(value)}`,
+            );
+          }
+        }
+        return lines.length > 0
+          ? lines.join("\n")
+          : JSON.stringify(stats, null, 2);
+      }),
+  );
+
+  server.registerTool(
+    "okf_validate",
+    {
+      description:
+        "Validate the knowledge base against the OKF bundle spec; reports validity, errors, warnings, and stats.",
+      inputSchema: {},
+    },
+    async () =>
+      run(async () => {
+        const report = (await api("/v1/okf/validate", {
+          method: "POST",
+        })) as Record<string, unknown>;
+        const valid = report["valid"] === true ? "valid" : "INVALID";
+        const errors = Array.isArray(report["errors"])
+          ? (report["errors"] as unknown[]).length
+          : 0;
+        const warnings = Array.isArray(report["warnings"])
+          ? (report["warnings"] as unknown[]).length
+          : 0;
+        return [
+          `bundle ${valid} (${errors} error(s), ${warnings} warning(s))`,
+          JSON.stringify(report, null, 2),
+        ].join("\n");
+      }),
+  );
+
+  server.registerTool(
+    "delete_page",
+    {
+      description:
+        "Delete a page. Like propose_edit, the current hash is fetched first unless expected_hash is given and sent via If-Match.",
+      inputSchema: {
+        path: z.string().describe("Page path to delete"),
+        expected_hash: z
+          .string()
+          .optional()
+          .describe("Hash the delete is based on (OCC guard)"),
+      },
+    },
+    async ({ path, expected_hash }) =>
+      run(async () => {
+        let hash = expected_hash;
+        if (!hash) {
+          const current = (await api(`/v1/pages/${encPath(path)}`)) as Record<
+            string,
+            unknown
+          >;
+          const currentHash = current["hash"];
+          if (typeof currentHash !== "string" || !currentHash) {
+            throw new Error(
+              "could not determine current hash for the page; pass expected_hash explicitly.",
+            );
+          }
+          hash = currentHash;
+        }
+        try {
+          const result = await api(`/v1/pages/${encPath(path)}`, {
+            method: "DELETE",
+            headers: { "If-Match": hash },
+          });
+          return JSON.stringify(result, null, 2);
+        } catch (err) {
+          if (err instanceof ApiError && err.status === 409) {
+            return [
+              "Conflict (HTTP 409): the page changed since your expected_hash was taken.",
+              "Re-read the page and retry with a fresh expected_hash.",
+              "",
+              "Conflict payload:",
+              err.body,
+            ].join("\n");
+          }
+          throw err;
+        }
+      }),
+  );
+
+  server.registerTool(
+    "put_source",
+    {
+      description:
+        "Create or overwrite a raw source document. Set force to bypass conflict checks.",
+      inputSchema: {
+        path: z.string().describe("Source path within the wiki root"),
+        content: z.string().describe("Raw source content"),
+        force: z.boolean().default(false).optional(),
+      },
+    },
+    async ({ path, content, force }) =>
+      run(async () => {
+        const suffix = force ? "?force=true" : "";
+        return JSON.stringify(
+          await api(`/v1/sources/${encPath(path)}${suffix}`, {
+            method: "POST",
+            body: JSON.stringify({ content }),
+          }),
+          null,
+          2,
+        );
+      }),
+  );
+
+  server.registerTool(
+    "add_feedback",
+    {
+      description: "Submit feedback on a query result.",
+      inputSchema: {
+        query_id: z.string().describe("Query id the feedback refers to"),
+        helpful: z.boolean().describe("Whether the answer was helpful"),
+        comment: z.string().optional(),
+      },
+    },
+    async ({ query_id, helpful, comment }) =>
+      run(async () => {
+        const body: Record<string, unknown> = { query_id, helpful };
+        if (comment !== undefined) body["comment"] = comment;
+        return JSON.stringify(
+          await api("/v1/feedback", {
+            method: "POST",
+            body: JSON.stringify(body),
+          }),
+          null,
+          2,
+        );
+      }),
+  );
 }

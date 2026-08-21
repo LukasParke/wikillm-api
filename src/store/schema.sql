@@ -146,3 +146,21 @@ CREATE TABLE IF NOT EXISTS feedback (
   comment TEXT,
   created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  updated_by TEXT
+);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+  name TEXT PRIMARY KEY,
+  key_hash TEXT NOT NULL UNIQUE,
+  key_prefix TEXT NOT NULL,
+  scope TEXT NOT NULL DEFAULT '["*"]',
+  role TEXT NOT NULL DEFAULT 'write',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  created_by TEXT
+);

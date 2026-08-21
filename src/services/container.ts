@@ -9,6 +9,22 @@ import { GraphService } from "./graphService.js";
 import { OkfService } from "./okfService.js";
 import { createProjectService } from "./projectService.js";
 import { ConnectorManager } from "../connectors/manager.js";
+import { SettingsService } from "./settingsService.js";
+import { KeyRegistry } from "./keyRegistry.js";
+
+/**
+ * Shared mutable LLM handle: settings changes swap `current` in place so
+ * search/query/pipeline pick up new providers without restart.
+ */
+export class LlmHolder {
+  constructor(public current: LlmProvider | null) {}
+}
+
+/** Live settings getters consumed at request time (never stale). */
+export interface RuntimeFlags {
+  llm: () => LlmProvider | null;
+  distillEnabled: () => Promise<boolean>;
+}
 
 /**
  * Process-wide service container. Built once at boot; routes construct the
@@ -17,7 +33,9 @@ import { ConnectorManager } from "../connectors/manager.js";
 export interface Services {
   config: Config;
   store: Store;
-  llm: LlmProvider | null;
+  settings: SettingsService;
+  keys: KeyRegistry;
+  llmHolder: LlmHolder;
   pipeline: IndexPipeline;
   search: SearchService;
   query: QueryService;
@@ -32,28 +50,70 @@ export async function createServices(
   injectedStore?: Store,
 ): Promise<Services> {
   const store = injectedStore ?? (await createStore(config));
-  const llm = createLlmProviderFromEnv(process.env);
+  const settings = new SettingsService(store, config);
+  const keys = new KeyRegistry(store, envKeyEntries(config));
+
+  // Bootstrap: an instance with no configured keys mints one admin key and
+  // prints it once, so deployment -> configuration happens entirely via API.
+  if (!keys.hasEnvKeys() && (await store.countApiKeys()) === 0) {
+    const secret = process.env.BOOTSTRAP_ADMIN_KEY || undefined;
+    const created = await keys.createKey({
+      name: "bootstrap-admin",
+      secret,
+      role: "admin",
+      scope: ["*"],
+      createdBy: "bootstrap",
+    });
+    console.log(
+      `\n=== WikiLLM bootstrap admin key (shown once; store it now) ===\n  ${created.secret}\n=== Configure the instance via PUT /v1/settings, POST /v1/keys ===\n`,
+    );
+  }
+
+  await settings.warm();
+  const llmHolder = new LlmHolder(buildLlm(config, settings));
+  const flags: RuntimeFlags = {
+    llm: () => llmHolder.current,
+    distillEnabled: async () =>
+      (await settings.get<boolean>("llm_distill")) === true,
+  };
   const pipeline = new IndexPipeline(
     config.WIKI_ROOT,
     store,
-    llm,
-    config.LLM_DISTILL,
+    flags,
     (msg, err) => {
       if (err) console.error(msg, err);
       else if (config.LOG_LEVEL === "debug") console.log(msg);
     },
   );
-  const search = new SearchService(store, llm);
-  const query = new QueryService(store, llm, search);
+  const search = new SearchService(store, flags);
+  const query = new QueryService(store, flags, search);
   const graph = new GraphService(store);
-  const okf = new OkfService(config);
+  const okf = new OkfService(config, settings);
   const projects = createProjectService(store);
   const connectors = new ConnectorManager(store, pipeline);
+
+  settings.onChange((key, value) => {
+    if (
+      key === "llm_base_url" ||
+      key === "llm_api_key" ||
+      key === "llm_model" ||
+      key === "llm_embed_model"
+    ) {
+      llmHolder.current = buildLlm(config, settings);
+      console.log(`LLM provider rebuilt after settings change: ${key}`);
+    }
+    if (key === "connector_poll_seconds") {
+      connectors.stop();
+      connectors.start(Number(value) || config.CONNECTOR_POLL_SECONDS);
+    }
+  });
 
   return {
     config,
     store,
-    llm,
+    settings,
+    keys,
+    llmHolder,
     pipeline,
     search,
     query,
@@ -64,8 +124,71 @@ export async function createServices(
   };
 }
 
+/** Build a provider from live settings, falling back to env config. */
+function buildLlm(
+  config: Config,
+  settings: SettingsService,
+): LlmProvider | null {
+  const cache = settings.cacheSnapshot();
+  const baseUrl =
+    (cache.get("llm_base_url")?.value as string | undefined) ?? "";
+  const effectiveEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    LLM_BASE_URL:
+      baseUrl.length > 0 ? baseUrl : (process.env.LLM_BASE_URL ?? ""),
+    LLM_API_KEY:
+      (cache.get("llm_api_key")?.value as string | undefined) ||
+      process.env.LLM_API_KEY ||
+      "",
+    LLM_MODEL:
+      (cache.get("llm_model")?.value as string | undefined) || config.LLM_MODEL,
+    LLM_EMBED_MODEL:
+      (cache.get("llm_embed_model")?.value as string | undefined) ||
+      process.env.LLM_EMBED_MODEL ||
+      "",
+    EMBEDDING_DIMS: String(
+      cache.get("embedding_dims")?.value ?? config.EMBEDDING_DIMS,
+    ),
+  };
+  return createLlmProviderFromEnv(effectiveEnv);
+}
+
+function envKeyEntries(config: Config): Map<
+  string,
+  {
+    name: string;
+    secret: string;
+    role: "admin" | "write" | "read";
+    scope: string[];
+  }
+> {
+  const out = new Map<
+    string,
+    {
+      name: string;
+      secret: string;
+      role: "admin" | "write" | "read";
+      scope: string[];
+    }
+  >();
+  for (const entry of config.API_KEYS.values()) {
+    out.set(entry.key, {
+      name: entry.name,
+      secret: entry.key,
+      role: entry.role,
+      scope: entry.projects,
+    });
+  }
+  return out;
+}
+
 export async function startConnectors(services: Services): Promise<void> {
-  services.connectors.start(services.config.CONNECTOR_POLL_SECONDS);
+  const pollSeconds = (await services.settings.get(
+    "connector_poll_seconds",
+  )) as number;
+  services.connectors.start(
+    Number(pollSeconds) || services.config.CONNECTOR_POLL_SECONDS,
+  );
 }
 
 export function stopConnectors(services: Services): void {

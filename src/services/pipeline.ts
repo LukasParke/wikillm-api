@@ -18,7 +18,7 @@ import { isIgnoredPath, relativeToWiki } from "../fs/paths.js";
 import { readPage } from "../fs/wiki.js";
 import type { ChunkInput, DocumentInput, Store } from "../store/types.js";
 import type { ChangeEvent } from "../types/index.js";
-import type { LlmProvider } from "../llm/provider.js";
+import type { RuntimeFlags } from "./container.js";
 
 export interface FileAttribution {
   source: "api" | "external" | null;
@@ -48,8 +48,7 @@ export class IndexPipeline {
   constructor(
     wikiRoot: string,
     private readonly store: Store,
-    private readonly llm: LlmProvider | null,
-    private readonly distillEnabled = false,
+    private readonly flags: RuntimeFlags,
     private readonly log: (msg: string, err?: unknown) => void = console.log,
   ) {
     this.wikiRoot = wikiRoot;
@@ -185,7 +184,7 @@ export class IndexPipeline {
       .filter((t) => t.length > 0 && t !== record.rel_path);
     await this.store.replaceEdges(record.rel_path, edgeTargets);
 
-    const embedModel = this.llm?.embedModel ?? null;
+    const embedModel = this.flags.llm()?.embedModel ?? null;
     if (embedModel && chunks.length > 0) {
       this.enqueueEmbed(record.id);
     }
@@ -206,7 +205,9 @@ export class IndexPipeline {
         const documentId = this.embedQueue.shift();
         if (!documentId) continue;
         this.queued.delete(documentId);
-        await this.distillDocument(documentId);
+        if (await this.flags.distillEnabled()) {
+          await this.distillDocument(documentId);
+        }
         await this.embedDocument(documentId);
       }
     } finally {
@@ -216,8 +217,8 @@ export class IndexPipeline {
 
   /** Optional LLM distillation: extract a searchable question/summary per chunk. */
   private async distillDocument(documentId: string): Promise<void> {
-    const llm = this.llm;
-    if (!llm || !this.distillEnabled) return;
+    const llm = this.flags.llm();
+    if (!llm) return;
     try {
       const chunks = await this.store.getChunksForDocument(documentId);
       for (const chunk of chunks.slice(0, 12)) {
@@ -257,7 +258,7 @@ export class IndexPipeline {
   }
 
   private async embedDocument(documentId: string): Promise<void> {
-    const llm = this.llm;
+    const llm = this.flags.llm();
     const embedModel = llm?.embedModel ?? null;
     if (!llm || !embedModel) return;
     try {

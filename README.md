@@ -28,7 +28,7 @@ hybrid retrieval.
 - **Projects & RBAC** — named project scopes with per-key `read`/`write`/`admin` roles.
 - **MCP server** — LLM-free retrieval tools for agents over stdio or Streamable HTTP.
 - **Analytics** — Prometheus `/metrics`, query analytics, and a feedback loop.
-- **Batch ingestion** — update a source, many wiki pages, `log.md`, and `index.md` in one request.
+- **Fully runtime-configurable** — settings, LLM endpoint, and rate limits hot-apply via `GET/PUT /v1/settings/:key` (no restart); fresh instances bootstrap an admin key automatically.
 
 ## Quick start
 
@@ -64,7 +64,7 @@ distillation, and `POST /v1/query`. Without it, everything else still works in f
 | Variable | Required | Default | Description |
 | -------- | -------- | ------- | ----------- |
 | `WIKI_ROOT` | yes | — | Path to the wiki/knowledge-base folder |
-| `API_KEYS` | yes | — | Comma-separated `name:key[:scope[:role]]` entries (see [Auth](#auth)) |
+| `API_KEYS` | no | — | Comma-separated `name:key[:scope[:role]]` entries (see [Auth](#auth)). **Optional**: a fresh instance with no keys mints a bootstrap admin key and prints it to the log once |
 | `PORT` | no | `3000` | HTTP port |
 | `HOST` | no | `0.0.0.0` | Bind address |
 | `PUBLIC_READ` | no | `true` | Allow unauthenticated read access |
@@ -83,10 +83,12 @@ distillation, and `POST /v1/query`. Without it, everything else still works in f
 | `CONNECTOR_POLL_SECONDS` | no | `300` | Connector polling interval |
 | `RATE_LIMIT_RPM` | no | `0` | Requests per minute per identity; `0` disables |
 | `LOG_LEVEL` | no | `info` | `trace`, `debug`, `info`, `warn`, `error` |
+| `BOOTSTRAP_ADMIN_KEY` | no | — | Pin the bootstrap admin key instead of a random one (only used when no keys are configured) |
 
 ## Auth
 
-`API_KEYS` entries follow the grammar `name:key[:scope[:role]]`:
+`API_KEYS` entries follow the grammar `name:key[:scope[:role]]` (the variable is optional —
+see [Bootstrap flow](#runtime-configuration-no-restart) for keyless first boot):
 
 - **scope** — comma-separated project names or `*` (default `*`, all projects).
 - **role** — `admin`, `write`, or `read` (default `write`).
@@ -137,6 +139,85 @@ All routes are under `/v1` unless noted.
 | POST | `/v1/admin/reindex` | Rebuild the index from the filesystem (admin) |
 | GET | `/v1/admin/stats` | Store overview stats (admin) |
 | POST | `/v1/feedback` | Rate a query answer (`query_id`, `helpful`, `comment?`) |
+| GET | `/v1` | Service self-description: info, full endpoint inventory, MCP invocation instructions |
+| GET | `/v1/settings` | List runtime settings with metadata; secrets masked (admin) |
+| GET/PUT/DELETE | `/v1/settings/:key` | Read/update/delete a runtime setting (admin); hot-applied at runtime |
+| GET/POST | `/v1/keys` | List / create API keys (admin); plaintext returned once, stored hashed |
+| DELETE | `/v1/keys/:name` | Delete an API key (admin) |
+
+### Runtime configuration (no restart)
+
+Most settings are **runtime-configurable**: precedence is DB override > environment
+variable > default. Admins manage them via the settings API (`Authorization: Bearer <key>`):
+
+```bash
+curl http://localhost:3000/v1/settings -H "Authorization: Bearer <admin-key>"
+curl -X PUT http://localhost:3000/v1/settings/rate_limit_rpm \
+```
+
+Hot-appliable keys include: `public_read`, `rate_limit_rpm`, `connector_poll_seconds`,
+`llm_base_url`, `llm_api_key` (secret — write-only, masked in listings), `llm_model`,
+`llm_embed_model`, `embedding_dims`, `llm_distill`, `okf_strict`, `human_actors`, `layout`.
+
+**Secrets are masked** in `GET /v1/settings` responses.
+
+**Changing `embedding_dims` wipes existing embeddings**; the response includes
+`reindex_required: true`. Rebuild vectors afterward:
+
+```bash
+curl -X POST http://localhost:3000/v1/admin/reindex -H "Authorization: Bearer <admin-key>"
+```
+
+**Immutable deployment-level settings** (`wiki_root`, `port`, `host`, `db_backend`,
+`database_url`) are reported via `GET /v1/settings` but a `PUT` returns `405`.
+
+**Bootstrap flow:** `API_KEYS` is optional. A fresh instance with zero configured keys mints
+one admin key and prints it to the log exactly once:
+
+```
+WikiLLM bootstrap admin key ... shown once
+```
+
+Set `BOOTSTRAP_ADMIN_KEY` to pin that secret instead of a random one.
+
+## Post-deploy setup entirely via API/MCP
+
+A fresh deployment needs no shell access to configure — everything happens over the API
+(or the equivalent MCP tools). Concrete curl sequence:
+
+```bash
+BASE=http://localhost:3000
+
+# 1. Read the bootstrap admin key from the container logs (printed once)
+docker compose logs wikillm-api | grep "bootstrap admin key"
+
+# 2. Create a real agent key (plaintext is returned exactly once, stored hashed)
+curl -X POST $BASE/v1/keys -H "Authorization: Bearer <bootstrap-key>" \
+  -H "Content-Type: application/json" -d '{"name": "agent-main", "role": "admin"}'
+
+# 3. Delete the bootstrap key
+curl -X DELETE $BASE/v1/keys/bootstrap -H "Authorization: Bearer <bootstrap-key>"
+
+# 4. Configure the LLM endpoint at runtime (no restart)
+curl -X PUT $BASE/v1/settings/llm_base_url -H "Authorization: Bearer <agent-key>" \
+  -H "Content-Type: application/json" -d '{"value": "https://api.cerebras.ai/v1"}'
+curl -X PUT $BASE/v1/settings/llm_api_key -H "Authorization: Bearer <agent-key>" \
+  -H "Content-Type: application/json" -d '{"value": "sk-..."}'
+curl -X PUT $BASE/v1/settings/llm_model -H "Authorization: Bearer <agent-key>" \
+  -H "Content-Type: application/json" -d '{"value": "llama3.1"}'
+
+# 5. Create a connector and a project
+curl -X POST $BASE/v1/connectors -H "Authorization: Bearer <agent-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"type": "git", "name": "docs", "url": "https://github.com/org/docs"}'
+curl -X PUT $BASE/v1/projects/main -H "Authorization: Bearer <agent-key>" \
+  -H "Content-Type: application/json" -d '{"description": "Main knowledge base"}'
+```
+
+The same flow via MCP tool names (`key_create`, `settings_set`, `connector_create`,
+`project_put`): call `key_create` to mint the agent key, `settings_set` for each runtime
+setting (`llm_base_url`, `llm_api_key`, `llm_model`, …), then `connector_create` and
+`project_put` to wire up sources and projects — all without touching the server.
 
 ### Search
 
@@ -243,9 +324,12 @@ ws.onmessage = (event) => {
 
 ## MCP server
 
-WikiLLM API ships an MCP server (`src/mcp.ts`) exposing LLM-free retrieval primitives to
-agents: `search`, `get_concept`, `read_source`, `list_changes`, `graph_neighbors`,
-`propose_edit`, `append_log`, `query`, and `refresh_index`.
+WikiLLM API ships an MCP server (`src/mcp.ts`) exposing **29 tools** covering the entire
+control surface: the original retrieval primitives (`search`, `get_concept`, `read_source`,
+`list_changes`, `graph_neighbors`, `propose_edit`, `append_log`, `query`, `refresh_index`)
+plus full management — `settings_get`/`settings_set`/`settings_delete`/`settings_list`,
+`key_create`/`keys_list`/`key_delete`, `project_*`, `connectors_*` (including run),
+`admin_reindex`/`admin_stats`, `okf_validate`, `delete_page`, `put_source`, and `add_feedback`.
 
 It runs over **stdio** by default. Set `MCP_HTTP_PORT` to enable **Streamable HTTP** with
 Bearer auth (`WIKILLM_API_KEY`) pointing at a running instance via `WIKILLM_URL`.

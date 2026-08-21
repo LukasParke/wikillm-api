@@ -15,8 +15,8 @@ const configSchema = z.object({
   HOST: z.string().default("0.0.0.0"),
   API_KEYS: z
     .string()
-    .min(1, "API_KEYS is required")
-    .transform((s) => parseApiKeys(s)),
+    .optional()
+    .transform((s) => parseApiKeys(s ?? "")),
   PUBLIC_READ: boolish(true),
   DB_PATH: z.string().optional(),
   LOG_LEVEL: z
@@ -67,6 +67,7 @@ export interface ApiKeyEntry {
 export function parseApiKeys(raw: string): Map<string, ApiKeyEntry> {
   const map = new Map<string, ApiKeyEntry>();
   for (const part of raw.split(",")) {
+    if (!raw.trim()) break;
     const trimmed = part.trim();
     if (!trimmed) continue;
     const segments = trimmed.split(":");
@@ -93,9 +94,6 @@ export function parseApiKeys(raw: string): Map<string, ApiKeyEntry> {
     const resolvedRole: ApiKeyEntry["role"] =
       role === "admin" || role === "read" ? role : "write";
     map.set(key, { name, key, projects, role: resolvedRole });
-  }
-  if (map.size === 0) {
-    throw new Error("API_KEYS must contain at least one key");
   }
   return map;
 }

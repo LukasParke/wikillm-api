@@ -6,6 +6,9 @@ import { ulid } from "ulidx";
 import type { ChangeEvent, Operation } from "../types/index.js";
 import {
   TRUST_ORDER,
+  type ApiKeyRecord,
+  type ApiKeyUpsert,
+  type SettingsMap,
   type ChunkHit,
   type ChunkInput,
   type ChunkRecord,
@@ -778,6 +781,14 @@ export class SqliteStore implements Store {
 
   // -- Maintenance --------------------------------------------------------------
 
+  resetEmbeddings(): Promise<void> {
+    this.db.prepare("DELETE FROM embeddings").run();
+    this.db
+      .prepare("UPDATE chunks SET embedded_at = NULL, embed_model = NULL")
+      .run();
+    return Promise.resolve();
+  }
+
   deleteDerivedForOrigin(origin: string): Promise<void> {
     this.db
       .prepare(
@@ -787,6 +798,94 @@ export class SqliteStore implements Store {
       .run(origin);
     this.db.prepare("DELETE FROM documents WHERE origin = ?").run(origin);
     return Promise.resolve();
+  }
+  // -- Settings ---------------------------------------------------------------
+
+  getSettings(): Promise<SettingsMap> {
+    const rows = this.db
+      .prepare("SELECT key, value FROM settings")
+      .all() as unknown[];
+    const out: SettingsMap = {};
+    for (const r of rows) {
+      const row = asRow(r);
+      out[s(row.key)!] = json(row.value, null);
+    }
+    return Promise.resolve(out);
+  }
+
+  setSetting(key: string, value: unknown, updatedBy: string): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO settings (key, value, updated_at, updated_by) VALUES (?,?,?,?)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value,
+           updated_at=excluded.updated_at, updated_by=excluded.updated_by`,
+      )
+      .run(key, JSON.stringify(value), new Date().toISOString(), updatedBy);
+    return Promise.resolve();
+  }
+
+  deleteSetting(key: string): Promise<boolean> {
+    const res = this.db.prepare("DELETE FROM settings WHERE key = ?").run(key);
+    return Promise.resolve(res.changes > 0);
+  }
+
+  // -- API keys ---------------------------------------------------------------
+
+  listApiKeys(): Promise<ApiKeyRecord[]> {
+    const rows = this.db
+      .prepare("SELECT * FROM api_keys ORDER BY name")
+      .all() as unknown[];
+    return Promise.resolve(rows.map((r) => rowToApiKey(asRow(r))));
+  }
+
+  getApiKey(name: string): Promise<ApiKeyRecord | null> {
+    const row = this.db
+      .prepare("SELECT * FROM api_keys WHERE name = ?")
+      .get(name);
+    return Promise.resolve(row ? rowToApiKey(asRow(row)) : null);
+  }
+
+  findApiKeyByHash(keyHash: string): Promise<ApiKeyRecord | null> {
+    const row = this.db
+      .prepare("SELECT * FROM api_keys WHERE key_hash = ?")
+      .get(keyHash);
+    return Promise.resolve(row ? rowToApiKey(asRow(row)) : null);
+  }
+
+  upsertApiKey(input: ApiKeyUpsert): Promise<void> {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO api_keys (name, key_hash, key_prefix, scope, role, created_at, updated_at, created_by)
+         VALUES (?,?,?,?,?,?,?,?)
+         ON CONFLICT(name) DO UPDATE SET key_hash=excluded.key_hash,
+           key_prefix=excluded.key_prefix, scope=excluded.scope, role=excluded.role,
+           updated_at=excluded.updated_at, created_by=excluded.created_by`,
+      )
+      .run(
+        input.name,
+        input.key_hash,
+        input.key_prefix,
+        jstr(input.scope) ?? '["*"]',
+        input.role,
+        now,
+        now,
+        input.created_by,
+      );
+    return Promise.resolve();
+  }
+
+  deleteApiKey(name: string): Promise<boolean> {
+    const res = this.db
+      .prepare("DELETE FROM api_keys WHERE name = ?")
+      .run(name);
+    return Promise.resolve(res.changes > 0);
+  }
+
+  countApiKeys(): Promise<number> {
+    return Promise.resolve(
+      num(asRow(this.db.prepare("SELECT COUNT(*) AS n FROM api_keys").get()).n),
+    );
   }
 }
 
@@ -845,6 +944,19 @@ function rowToConnector(row: Row): ConnectorConfig {
     enabled: bool(row.enabled),
     created_at: s(row.created_at)!,
     updated_at: s(row.updated_at)!,
+  };
+}
+
+function rowToApiKey(row: Row): ApiKeyRecord {
+  return {
+    name: s(row.name)!,
+    key_hash: s(row.key_hash)!,
+    key_prefix: s(row.key_prefix)!,
+    scope: json<string[]>(row.scope, ["*"]),
+    role: s(row.role) as ApiKeyRecord["role"],
+    created_at: s(row.created_at)!,
+    updated_at: s(row.updated_at)!,
+    created_by: s(row.created_by)!,
   };
 }
 

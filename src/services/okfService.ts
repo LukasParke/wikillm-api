@@ -7,9 +7,13 @@ import type {
   ValidationIssue,
 } from "../okf/validate.js";
 import type { Config } from "../config.js";
+import type { SettingsService } from "./settingsService.js";
 
 export class OkfService {
-  constructor(private readonly config: Config) {}
+  constructor(
+    private readonly config: Config,
+    private readonly settings?: SettingsService,
+  ) {}
 
   validateSingle(raw: string, relPath = "concept.md"): ValidationIssue[] {
     return validateConceptFile(relPath, raw);
@@ -47,8 +51,10 @@ export class OkfService {
     return out;
   }
 
-  layoutProfile(): "okf" | "wikillm" {
-    if (this.config.LAYOUT !== "auto") return this.config.LAYOUT;
+  async layoutProfile(): Promise<"okf" | "wikillm"> {
+    const configured = ((await this.settings?.get<string>("layout")) ??
+      this.config.LAYOUT) as "auto" | "okf" | "wikillm";
+    if (configured !== "auto") return configured;
     const rootIndex = path.join(this.config.WIKI_ROOT, "index.md");
     if (exists(rootIndex)) {
       const content = readFileSync(rootIndex, "utf8");

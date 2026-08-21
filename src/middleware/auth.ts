@@ -1,6 +1,6 @@
 import type { Context, Next } from "hono";
 import { createMiddleware } from "hono/factory";
-import type { ApiKeyEntry } from "../config.js";
+import type { KeyRegistry } from "../services/keyRegistry.js";
 
 export interface AuthInfo {
   name: string;
@@ -14,33 +14,33 @@ const ANONYMOUS: AuthInfo = {
   projects: ["*"],
 };
 
+/**
+ * Bearer-key auth against the KeyRegistry (env bootstrap keys + DB-managed
+ * keys). When public read is enabled (runtime setting), unauthenticated GETs
+ * pass as anonymous.
+ */
 export function authMiddleware(
-  apiKeys: Map<string, ApiKeyEntry>,
-  publicRead: boolean,
+  registry: KeyRegistry,
+  publicRead: () => boolean | Promise<boolean>,
 ) {
   return createMiddleware(async (c: Context, next: Next) => {
     const header = c.req.header("authorization") ?? "";
     const match = header.match(/^Bearer\s+(.+)$/i);
     if (match) {
-      const entry = apiKeys.get(match[1]);
-      if (entry) {
-        const auth: AuthInfo = {
-          name: entry.name,
-          role: entry.role,
-          projects: entry.projects,
-        };
+      const auth = await registry.verify(match[1]);
+      if (auth) {
         c.set("auth", auth);
-        c.set("source", entry.name);
+        c.set("source", auth.name);
         return next();
       }
-      if (!publicRead) {
+      if (!(await publicRead())) {
         return c.json(
           { error: "unauthorized", message: "Invalid API key" },
           401,
         );
       }
     }
-    if (c.req.method === "GET" && publicRead) {
+    if (c.req.method === "GET" && (await publicRead())) {
       c.set("auth", ANONYMOUS);
       c.set("source", ANONYMOUS.name);
       return next();
