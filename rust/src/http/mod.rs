@@ -788,6 +788,10 @@ struct SearchQuery {
     q: String,
     #[serde(default)]
     limit: Option<i64>,
+    #[serde(default)]
+    expand: Option<bool>,
+    #[serde(default)]
+    rerank: Option<bool>,
 }
 
 async fn search_handler(
@@ -801,17 +805,54 @@ async fn search_handler(
         kinds: Some(vec!["page".into(), "doc".into()]),
         ..Default::default()
     };
-    let result = state
+    let mut result = state
         .search
         .search(crate::services::search::SearchOptions {
             q: q.q.clone(),
             limit: q.limit.unwrap_or(20) as usize,
             filters: Some(filters),
-            rerank: false,
-            expand_context: false,
+            rerank: q.rerank.unwrap_or(true),
+            expand_context: q.expand.unwrap_or(true),
         })
         .await
         .map_err(|e| map_err(&e))?;
+
+    // Auto-trigger PPR expansion when results are sparse (multi-hop indicator)
+    if result.results.len() < 5 && !result.results.is_empty() {
+        let seeds: Vec<(String, f64)> = result
+            .results
+            .iter()
+            .take(5)
+            .map(|r| (r.rel_path.clone(), r.score))
+            .collect();
+        if let Ok(expanded) = crate::services::ppr::ppr_expand(
+            &state.store, &seeds, 0.85, 10, 10,
+        ).await {
+            for (path, score) in expanded.iter().take(5) {
+                if !result.results.iter().any(|r| r.rel_path == *path) {
+                    if let Ok(Some(doc)) = state.store.get_document(path).await {
+                        result.results.push(crate::services::search::SearchHit {
+                            rel_path: doc.rel_path.clone(),
+                            title: doc.title.clone(),
+                            kind: doc.kind.as_str().to_string(),
+                            origin: doc.origin.clone(),
+                            okf_type: doc.okf_type.clone(),
+                            tags: doc.tags.clone(),
+                            status: doc.status.clone(),
+                            stale_after: doc.stale_after.clone(),
+                            trust: "unverified".into(),
+                            hash: doc.hash.clone(),
+                            mtime: doc.mtime,
+                            heading_path: None,
+                            snippet: format!("Graph-connected document (PPR score: {score:.4})"),
+                            score: *score * 0.5, // dampen graph-only matches
+                            context: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
     state.metrics.counter(
         "wikillm_search_total",
         &[],
