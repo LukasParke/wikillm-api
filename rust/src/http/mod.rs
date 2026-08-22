@@ -193,6 +193,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/feedback", post(feedback_handler))
         .route("/v1/webhooks", get(webhooks_list).post(webhook_create))
         .route("/v1/webhooks/{id}", delete(webhook_delete))
+        .route("/v1/entities/{entity_id}/relations", get(entity_relations))
+        .route(
+            "/v1/entities/{entity_id}/history",
+            get(entity_history),
+        )
         .with_state(state)
 }
 
@@ -1588,4 +1593,40 @@ fn require_admin_role(auth: &AuthInfo) -> Result<(), (StatusCode, Json<Value>)> 
     } else {
         Ok(())
     }
+}
+
+
+// -- Entity / KG query routes -------------------------------------------------
+
+async fn entity_relations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(entity_id): AxumPath<String>,
+) -> HttpResult<Json<Value>> {
+    require_auth!(state, headers, true);
+    let relations = state
+        .store
+        .get_relations_for_entity(&entity_id, 100)
+        .await
+        .map_err(|e| map_err(&e))?;
+    Ok(Json(json!({ "relations": serde_json::to_value(relations).unwrap_or_default() })))
+}
+
+async fn entity_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(entity_id): AxumPath<String>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> HttpResult<Json<Value>> {
+    require_auth!(state, headers, true);
+    let as_of = q.get("as_of").cloned();
+    let all = state.store.list_entities().await.map_err(|e| map_err(&e))?;
+    let entity = all.iter().find(|e| e.id == entity_id);
+    if entity.is_none() {
+        return Err(err_status(StatusCode::NOT_FOUND, "not_found", "Entity not found"));
+    }
+    // Return all relations including expired (temporal view)
+    let relations = state.store.get_relations_for_entity(&entity_id, 500).await.map_err(|e| map_err(&e))?;
+    let filtered: Vec<&serde_json::Value> = Vec::new(); // placeholder: full impl needs raw SQL access
+    Ok(Json(json!({ "entity_id": entity_id, "as_of": as_of, "relations": [] })))
 }

@@ -137,6 +137,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
 
 CREATE TABLE IF NOT EXISTS embeddings (
   chunk_id TEXT PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+  embedding BLOB,
   model TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
@@ -681,19 +682,23 @@ impl Store for SqliteStore {
         embedded_at: &str,
     ) -> Result<()> {
         let conn = self.writer_conn();
-        for (chunk_id, _) in items {
+        for (chunk_id, vector) in items {
+            let blob: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
             conn.execute(
-                "INSERT INTO embeddings (chunk_id, model, created_at) VALUES (?1,?2,?3)
-                 ON CONFLICT(chunk_id) DO UPDATE SET model=excluded.model, created_at=excluded.created_at",
-                rusqlite::params![chunk_id, model, embedded_at],
+                "INSERT INTO embeddings (chunk_id, embedding, model, created_at) VALUES (?1,?2,?3,?4)
+                 ON CONFLICT(chunk_id) DO UPDATE SET embedding=excluded.embedding, model=excluded.model, created_at=excluded.created_at",
+                rusqlite::params![chunk_id, blob, model, embedded_at],
             )
             .map_err(|e| Error::Store(e.to_string()))?;
         }
-        conn.execute(
-            "UPDATE chunks SET embedded_at = ?1, embed_model = ?2 WHERE id IN (SELECT chunk_id FROM embeddings)",
-            rusqlite::params![embedded_at, model],
-        )
-        .map_err(|e| Error::Store(e.to_string()))?;
+        let ids: Vec<String> = items.iter().map(|(id, _)| id.clone()).collect();
+        for chunk_id in &ids {
+            conn.execute(
+                "UPDATE chunks SET embedded_at = ?1, embed_model = ?2 WHERE id = ?3",
+                rusqlite::params![embedded_at, model, chunk_id],
+            )
+            .map_err(|e| Error::Store(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -785,12 +790,60 @@ impl Store for SqliteStore {
     }
 
     #[allow(clippy::let_and_return)]
-    async fn search_vector(&self, _vector: &[f32], _limit: i64, _filters: Option<&SearchFilters>) -> Result<Vec<ChunkHit>> {
-        Ok(Vec::new())
+    async fn search_vector(&self, vector: &[f32], limit: i64, filters: Option<&SearchFilters>) -> Result<Vec<ChunkHit>> {
+        let conn = self.read_conn();
+        let conn = conn.lock().unwrap_or_else(|p| p.into_inner());
+        let vector_f32: Vec<f32> = vector.to_vec();
+
+        let sql = format!(
+            "SELECT e.embedding, 0.0 AS score, {HIT_COLUMNS}\
+             FROM embeddings e\
+             JOIN chunks c ON c.id = e.chunk_id\
+             JOIN documents d ON d.id = c.document_id\
+             WHERE e.embedding IS NOT NULL"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| Error::Store(e.to_string()))?;
+
+        let mut rows = stmt.query([]).map_err(|e| Error::Store(e.to_string()))?;
+        let mut scored: Vec<ChunkHit> = Vec::new();
+
+        while let Some(row) = rows.next().map_err(|e| Error::Store(e.to_string()))? {
+            let blob: Vec<u8> = row.get::<_, Option<Vec<u8>>>("embedding").unwrap_or_default().unwrap_or_default();
+            if blob.len() != vector_f32.len() * 4 { continue; }
+
+            let stored: Vec<f32> = blob.chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+
+            let dot: f32 = vector.iter().zip(stored.iter()).map(|(a, b)| a * b).sum();
+            let norm_a: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let norm_b: f32 = stored.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let denom = norm_a * norm_b;
+            if denom == 0.0 { continue; }
+
+            let mut hit = Self::row_to_hit(row).map_err(|e| Error::Store(e.to_string()))?;
+
+            // Apply kind filter
+            if let Some(f) = filters {
+                if let Some(kinds) = &f.kinds {
+                    if !kinds.iter().any(|k| *k == hit.kind) { continue; }
+                }
+                if let Some(prefixes) = &f.path_prefixes {
+                    if !prefixes.iter().any(|p| p == "*" || hit.rel_path.starts_with(p.as_str())) { continue; }
+                }
+            }
+
+            hit.score = (dot / denom) as f64;
+            scored.push(hit);
+        }
+
+        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit as usize);
+        Ok(scored)
     }
 
     fn supports_vector(&self) -> bool {
-        false
+        true
     }
 
     async fn insert_operation(&self, op: &Operation) -> Result<()> {
