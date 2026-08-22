@@ -83,15 +83,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let api_key = config.llm_api_key.clone().unwrap_or_default();
     let embed_model = config.llm_embed_model.clone().unwrap_or_default();
     let llm_base_url = settings.get_string("llm_base_url").await.unwrap_or_default();
-    let llm_holder = Arc::new(std::sync::RwLock::new(Some(
-        wikillm_api::llm::provider::create_from_env_snapshot(
-            &llm_base_url,
-            &api_key,
-            &config.llm_model,
-            &embed_model,
-            config.embedding_dims,
-        ),
-    )));
+    let llm_provider = wikillm_api::llm::provider::create_from_env_snapshot(
+        &llm_base_url,
+        &api_key,
+        &config.llm_model,
+        &embed_model,
+        config.embedding_dims,
+    );
+    let llm_holder = Arc::new(std::sync::RwLock::new(llm_provider));
 
     let embedder_holder: Arc<std::sync::RwLock<Option<Arc<dyn EmbedderLike>>>> =
         Arc::new(std::sync::RwLock::new(

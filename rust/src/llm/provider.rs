@@ -79,20 +79,24 @@ pub fn create_from_env_snapshot(
     model: &str,
     embed_model: &str,
     dims: i64,
-) -> DynLlmProvider {
+) -> Option<DynLlmProvider> {
+    // No valid base_url → no provider → rerank/embed/query all skip instantly
+    if base_url.trim().is_empty() || !base_url.starts_with("http") {
+        return None;
+    }
     let embed_model = if embed_model.trim().is_empty() {
         None
     } else {
         Some(embed_model)
     };
     let dims = if dims > 0 { Some(dims) } else { None };
-    Arc::new(openai_compatible(
+    Some(Arc::new(openai_compatible(
         base_url,
         Some(api_key),
         model,
         embed_model,
         dims,
-    ))
+    )))
 }
 
 impl OpenAiCompatible {
