@@ -204,6 +204,49 @@ fn vector_literal(v: &[f32]) -> String {
     format!("[{}]", v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","))
 }
 
+fn rows_to_memories(rows: &[tokio_postgres::Row]) -> Vec<crate::services::memory::AgentMemory> {
+    rows.iter().map(|row| {
+        let mt: String = row.get("memory_type");
+        crate::services::memory::AgentMemory {
+            id: row.get("id"),
+            scope_key: row.get("scope_key"),
+            memory_type: match mt.as_str() {
+                "episodic" => crate::services::memory::MemoryType::Episodic,
+                "procedural" => crate::services::memory::MemoryType::Procedural,
+                "preference" => crate::services::memory::MemoryType::Preference,
+                _ => crate::services::memory::MemoryType::Semantic,
+            },
+            content: row.get("content"),
+            created_at: row.get("created_at"),
+            accessed_at: row.get("accessed_at"),
+            access_count: row.get::<_, Option<i64>>("access_count").unwrap_or(0),
+            source_session_id: row.get("source_session_id"),
+            source_ref: row.get("source_ref"),
+        }
+    }).collect()
+}
+
+async fn bump_memory_access(store: &PostgresStore, results: &mut [crate::services::memory::AgentMemory]) -> Result<()> {
+    if results.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<String> = results.iter().map(|m| m.id.clone()).collect();
+    let placeholders = (1..=ids.len()).map(|i| format!("${}", i + 1)).collect::<Vec<_>>().join(",");
+    let sql = format!("UPDATE memories SET access_count = access_count + 1, accessed_at = $1 WHERE id IN ({placeholders})");
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::with_capacity(ids.len() + 1);
+    params.push(&now);
+    for id in &ids {
+        params.push(id);
+    }
+    store.execute(&sql, &params).await?;
+    // Returned rows must reflect post-bump state.
+    for m in results.iter_mut() {
+        m.access_count += 1;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl Store for PostgresStore {
     fn backend(&self) -> &'static str {
@@ -256,6 +299,10 @@ impl Store for PostgresStore {
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_ref TEXT",
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS promote_candidate INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE memories ADD COLUMN IF NOT EXISTS promoted_at TEXT",
+            // Full-text over memory content so paraphrased multi-word queries
+            // match without substring semantics (generated column, PG12+).
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS content_tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(content,''))) STORED",
+            "CREATE INDEX IF NOT EXISTS idx_memories_tsv ON memories USING GIN (content_tsv)",
             "CREATE TABLE IF NOT EXISTS transcript_watermarks (tool TEXT NOT NULL, transcript_path TEXT NOT NULL, last_line BIGINT NOT NULL DEFAULT 0, prefix_hash TEXT, last_synced_at TEXT, PRIMARY KEY (tool, transcript_path))",
             "CREATE INDEX IF NOT EXISTS idx_documents_stale_after ON documents(stale_after) WHERE stale_after IS NOT NULL",
         ];
@@ -821,47 +868,34 @@ impl Store for PostgresStore {
     }
 
     async fn search_memories(&self, scope_key: &str, query: &str, limit: i64) -> Result<Vec<crate::services::memory::AgentMemory>> {
+        // Term-based FTS first (paraphrased multi-word queries match on
+        // shared terms); fall back to substring ILIKE when the query is
+        // empty or FTS surfaces nothing.
+        if !query.trim().is_empty() {
+            let match_expr = crate::store::fts_query(query);
+            if !match_expr.is_empty() {
+                let rows = self.query(
+                    "SELECT * FROM memories \
+                     WHERE scope_key = $1 AND content_tsv @@ websearch_to_tsquery('english', $2) \
+                     ORDER BY ts_rank(content_tsv, websearch_to_tsquery('english', $2)) DESC, access_count DESC, created_at DESC LIMIT $3",
+                    &[&scope_key.to_string(), &match_expr, &limit],
+                ).await?;
+                let results = rows_to_memories(&rows);
+                if !results.is_empty() {
+                    let mut results = results;
+                    bump_memory_access(self, &mut results).await?;
+                    return Ok(results);
+                }
+                // FTS found nothing — fall through to ILIKE.
+            }
+        }
         let pattern = format!("%{}%", crate::store::like_escape(query));
         let rows = self.query(
             "SELECT * FROM memories WHERE scope_key = $1 AND content LIKE $2 ESCAPE '\\' ORDER BY access_count DESC, created_at DESC LIMIT $3",
             &[&scope_key.to_string(), &pattern, &limit],
         ).await?;
-        let mut results: Vec<crate::services::memory::AgentMemory> = rows.iter().map(|row| {
-            let mt: String = row.get("memory_type");
-            crate::services::memory::AgentMemory {
-                id: row.get("id"),
-                scope_key: row.get("scope_key"),
-                memory_type: match mt.as_str() {
-                    "episodic" => crate::services::memory::MemoryType::Episodic,
-                    "procedural" => crate::services::memory::MemoryType::Procedural,
-                    "preference" => crate::services::memory::MemoryType::Preference,
-                    _ => crate::services::memory::MemoryType::Semantic,
-                },
-                content: row.get("content"),
-                created_at: row.get("created_at"),
-                accessed_at: row.get("accessed_at"),
-                access_count: row.get::<_, Option<i64>>("access_count").unwrap_or(0),
-                source_session_id: row.get("source_session_id"),
-                source_ref: row.get("source_ref"),
-            }
-        }).collect();
-        // Side-effect: record an access for every returned memory.
-        if !results.is_empty() {
-            let ids: Vec<String> = results.iter().map(|m| m.id.clone()).collect();
-            let placeholders = (1..=ids.len()).map(|i| format!("${}", i + 1)).collect::<Vec<_>>().join(",");
-            let sql = format!("UPDATE memories SET access_count = access_count + 1, accessed_at = $1 WHERE id IN ({placeholders})");
-            let now = chrono::Utc::now().to_rfc3339();
-            let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::with_capacity(ids.len() + 1);
-            params.push(&now);
-            for id in &ids {
-                params.push(id);
-            }
-            self.execute(&sql, &params).await?;
-            // Returned rows must reflect post-bump state.
-            for m in &mut results {
-                m.access_count += 1;
-            }
-        }
+        let mut results = rows_to_memories(&rows);
+        bump_memory_access(self, &mut results).await?;
         Ok(results)
     }
 
@@ -945,7 +979,7 @@ impl Store for PostgresStore {
             &[&rel_path.to_string()],
         ).await?;
         let seq: i64 = rows.first().map(|r| r.get("next_seq")).unwrap_or(1);
-        let id = format!("rev-{}", &ulid::Ulid::new().to_string()[..12]);
+        let id = format!("rev-{}", ulid::Ulid::new());
         self.execute(
             "INSERT INTO document_revisions (id, rel_path, seq, hash, body, source, operation, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
             &[

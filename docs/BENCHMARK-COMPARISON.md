@@ -64,9 +64,12 @@ harness/corpus). Full tables in `rust/scripts/benchmark-results.md`.
 - New memory/versioning/community surfaces all serve at p50 ≤ 0.32ms
   (2.5k–6.4k req/s); see new-surface table in benchmark-results.md.
 - Memory-knowledge recall on a pristine instance: **100% across all six
-  dimensions** (<1ms avg). Known ceiling: memory search is substring-LIKE;
-  paraphrased probes miss (25% on adversarial multi-word queries in
-  final_benchmark). FTS-indexing the memories table is the follow-up.
+  dimensions** (<1ms avg). Adversarial multi-word recall in final_benchmark
+  initially read 25% (substring-LIKE ceiling) — fixed same-day by FTS-indexing
+  the memories table (SQLite FTS5 + PG tsvector/GIN): **25% → 100%** at
+  0.32ms recall p50. Also fixed en route: truncated-ULID id collisions
+  (`mm-`/`rev-`/`rel-`/`comm-`) that caused 1-in-200 UNIQUE violations under
+  load — all high-rate ids now carry full 26-char ULIDs.
 - Write path now also records an append-only revision per mutation; no
   regression was measurable at the harness's resolution.
 

@@ -212,7 +212,7 @@ impl SessionService {
         new_content: Option<&str>,
     ) -> Result<()> {
         let m = crate::store::MemoryMutation {
-            id: format!("mm-{}", &ulid::Ulid::new().to_string()[..12].to_lowercase()),
+            id: format!("mm-{}", ulid::Ulid::new().to_string().to_lowercase()),
             memory_id: memory_id.to_string(),
             action: action.to_string(),
             old_content: old_content.map(str::to_string),

@@ -273,7 +273,7 @@ pub async fn detect_communities(store: &Arc<dyn Store>) -> Result<Vec<Community>
                 .cloned()
                 .unwrap_or_else(|| members[0].clone());
             Community {
-                id: format!("comm-{}", &ulid::Ulid::new().to_string()[..8].to_lowercase()),
+                id: format!("comm-{}", ulid::Ulid::new().to_string().to_lowercase()),
                 label: titles.get(&head).cloned().unwrap_or(head),
                 member_paths: members,
             }

@@ -50,16 +50,20 @@ def pct(xs, p):
     return xs[min(int(len(xs) * p), len(xs) - 1)]
 
 
+FAILURES = []
+
 def bench(name, n, fn):
     lat = []
     ok = 0
     t0 = time.time()
     for i in range(n):
         s = time.time()
-        st, _ = fn(i)
+        st, body = fn(i)
         lat.append((time.time() - s) * 1000.0)
         if 200 <= st < 300:
             ok += 1
+        else:
+            FAILURES.append((name, i, st, json.dumps(body)[:160]))
     wall = time.time() - t0
     print(f"  {name:<34s} p50={pct(lat,0.5):7.2f}ms p95={pct(lat,0.95):7.2f}ms "
           f"p99={pct(lat,0.99):7.2f}ms ok={ok}/{n} rps={n/wall:9.0f}")
@@ -148,6 +152,10 @@ def main():
     bench("GET  /v1/admin/gaps", min(args.n, 50),
           lambda i: http("GET", f"{base}/v1/admin/gaps", headers=H))
 
+    if FAILURES:
+        print("\nFAILURES:")
+        for f in FAILURES:
+            print(" ", f)
     print("\nDone.")
 
 

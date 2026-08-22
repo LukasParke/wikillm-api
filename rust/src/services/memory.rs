@@ -317,7 +317,7 @@ fn now_rfc3339() -> String {
 
 /// `mm-` + 12-char ulid-style suffix (matches the `wh-`/`sess-` id pattern).
 fn new_mutation_id() -> String {
-    format!("mm-{}", &ulid::Ulid::new().to_string()[..12].to_lowercase())
+    format!("mm-{}", ulid::Ulid::new().to_string().to_lowercase())
 }
 
 /// Double-write gate: fall through to an Add only when the consolidation

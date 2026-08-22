@@ -261,7 +261,7 @@ impl IndexPipeline {
                 let src = self.resolve_node_key(&rel_path, &src).await;
                 let dst = self.resolve_node_key(&rel_path, &dst).await;
                 let edge = crate::services::kg::RelationRecord {
-                    id: format!("rel-{}", &ulid::Ulid::new().to_string()[..12].to_lowercase()),
+                    id: format!("rel-{}", ulid::Ulid::new().to_string().to_lowercase()),
                     src_entity: src,
                     dst_entity: dst,
                     relation_type,

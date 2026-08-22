@@ -112,6 +112,29 @@ Harness note: `final_benchmark.py`'s memory-recall section previously targeted
 a route that never existed (`/v1/memory/search?scope_key=`) and its quality
 section queried paths it never seeded — both sections read 0% historically.
 Both now exercise the real API (memory recall via `/v1/memory?q=&agent=`).
-The 25% memory-recall figure it reports reflects the ledger's substring-LIKE
-search ceiling on paraphrased queries — a known limitation, candidate for
-FTS-indexing memories.
+
+## 2026-08-22 follow-up — FTS-backed memory search (recall 25% → 100%)
+
+`search_memories` upgraded from substring LIKE to term-based full-text:
+
+- SQLite: `memories_fts` FTS5 virtual table maintained on insert/update/
+  delete, idempotent backfill in `migrate()`, bm25 ranking, scope-filtered
+  join; substring LIKE retained as fallback for empty queries and zero-FTS
+  matches.
+- Postgres: generated `content_tsv tsvector` column + GIN index,
+  `websearch_to_tsquery` ranking, ILIKE fallback.
+
+Results (fresh instance, same harness):
+
+| Metric | before | after |
+| --- | ---: | ---: |
+| memory recall (final_benchmark) | 2/8 = 25% | **8/8 = 100%** |
+| recall latency p50 | 0.23ms | 0.32ms |
+| `GET /v1/memory` search p50 | 0.23ms | 0.43ms (~2.4k req/s) |
+| `POST /v1/memory` success rate | 199/200 | **200/200** |
+
+The former single-failure-per-200 stores was a real bug: high-rate ids
+(`mm-`, `rev-`, `rel-`, `comm-`) truncated ULIDs to 12 chars, keeping only
+~2 random chars per millisecond — birthday collisions under load caused
+`UNIQUE constraint failed: memory_mutations.id`. All such ids now embed the
+full 26-char ULID.

@@ -135,6 +135,12 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
   content, heading_path, chunk_id UNINDEXED
 );
 
+-- Full-text index over agent memory content so paraphrased multi-word
+-- queries match without substring semantics.
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+  content, memory_id UNINDEXED
+);
+
 CREATE TABLE IF NOT EXISTS embeddings (
   chunk_id TEXT PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
   embedding BLOB,
@@ -484,6 +490,50 @@ impl SqliteStore {
     }
 }
 
+fn row_to_agent_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::services::memory::AgentMemory> {
+    Ok(crate::services::memory::AgentMemory {
+        id: row.get("id")?,
+        scope_key: row.get("scope_key")?,
+        memory_type: match row.get::<_, String>("memory_type")?.as_str() {
+            "episodic" => crate::services::memory::MemoryType::Episodic,
+            "procedural" => crate::services::memory::MemoryType::Procedural,
+            "preference" => crate::services::memory::MemoryType::Preference,
+            _ => crate::services::memory::MemoryType::Semantic,
+        },
+        content: row.get("content")?,
+        created_at: row.get("created_at")?,
+        accessed_at: row.get("accessed_at")?,
+        access_count: row.get("access_count")?,
+        source_session_id: row.get("source_session_id")?,
+        source_ref: row.get("source_ref")?,
+    })
+}
+
+/// Record an access for every returned memory; returned rows reflect
+/// post-bump state. Ids bind to ?1..?k, accessed_at to trailing ?k+1.
+fn bump_memory_access(conn: &rusqlite::Connection, results: &mut [crate::services::memory::AgentMemory]) -> Result<()> {
+    if results.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<String> = results.iter().map(|m| m.id.clone()).collect();
+    let placeholders = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "UPDATE memories SET access_count = access_count + 1, accessed_at = ?{n} WHERE id IN ({placeholders})",
+        n = ids.len() + 1
+    );
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 1);
+    for id in &ids {
+        params.push(id);
+    }
+    params.push(&now);
+    conn.execute(&sql, params.as_slice()).map_err(|e| Error::Store(e.to_string()))?;
+    for m in results.iter_mut() {
+        m.access_count += 1;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl Store for SqliteStore {
     fn backend(&self) -> &'static str {
@@ -505,6 +555,14 @@ impl Store for SqliteStore {
             let sql = format!("ALTER TABLE memories ADD COLUMN {col}");
             let _ = conn.execute(&sql, []);
         }
+        // Idempotent backfill: index any memory rows missing from the FTS
+        // table (pre-existing databases, or rows written before this index).
+        conn.execute_batch(
+            "INSERT INTO memories_fts(content, memory_id)
+             SELECT content, id FROM memories
+             WHERE id NOT IN (SELECT memory_id FROM memories_fts)",
+        )
+        .map_err(|e| Error::Store(e.to_string()))?;
         conn.execute(
             "INSERT OR IGNORE INTO migrations (id, applied_at) VALUES (2, ?)",
             [chrono::Utc::now().to_rfc3339()],
@@ -1457,11 +1515,66 @@ impl Store for SqliteStore {
                 promote_candidate.unwrap_or(false) as i64,
             ],
         ).map_err(|e| Error::Store(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO memories_fts (content, memory_id) VALUES (?1, ?2)",
+            rusqlite::params![content, id],
+        ).map_err(|e| Error::Store(e.to_string()))?;
         Ok(id)
+    }
+
+    async fn update_memory(&self, id: &str, new_content: &str, new_hash: &str) -> Result<()> {
+        let conn = self.writer_conn();
+        conn.execute(
+            "UPDATE memories SET content = ?1, content_hash = ?2, accessed_at = ?3 WHERE id = ?4",
+            rusqlite::params![new_content, new_hash, chrono::Utc::now().to_rfc3339(), id],
+        ).map_err(|e| Error::Store(e.to_string()))?;
+        conn.execute(
+            "DELETE FROM memories_fts WHERE memory_id = ?1",
+            [id],
+        ).map_err(|e| Error::Store(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO memories_fts (content, memory_id) VALUES (?1, ?2)",
+            rusqlite::params![new_content, id],
+        ).map_err(|e| Error::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn delete_memory(&self, id: &str) -> Result<bool> {
+        let conn = self.writer_conn();
+        let n = conn.execute("DELETE FROM memories WHERE id = ?1", [id]).map_err(|e| Error::Store(e.to_string()))?;
+        if n > 0 {
+            conn.execute(
+                "DELETE FROM memories_fts WHERE memory_id = ?1",
+                [id],
+            ).map_err(|e| Error::Store(e.to_string()))?;
+        }
+        Ok(n > 0)
     }
 
     async fn search_memories(&self, scope_key: &str, query: &str, limit: i64) -> Result<Vec<crate::services::memory::AgentMemory>> {
         let conn = self.writer_conn();
+        // Term-based FTS first (paraphrased multi-word queries match on
+        // shared terms, not substrings); fall back to substring LIKE when
+        // the query is empty or FTS surfaces nothing.
+        if !query.trim().is_empty() {
+            let match_expr = crate::store::fts_query(query);
+            if !match_expr.is_empty() {
+                let mut stmt = conn.prepare(
+                    "SELECT m.* FROM memories_fts f JOIN memories m ON m.id = f.memory_id \
+                     WHERE memories_fts MATCH ?1 AND m.scope_key = ?2 \
+                     ORDER BY -bm25(memories_fts), m.access_count DESC, m.created_at DESC LIMIT ?3"
+                ).map_err(|e| Error::Store(e.to_string()))?;
+                let rows = stmt.query_map(rusqlite::params![match_expr, scope_key, limit], |row| {
+                    Ok(row_to_agent_memory(row)?)
+                }).map_err(|e| Error::Store(e.to_string()))?;
+                let mut results = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| Error::Store(e.to_string()))?;
+                if !results.is_empty() {
+                    bump_memory_access(&conn, &mut results)?;
+                    return Ok(results);
+                }
+                // FTS found nothing — fall through to LIKE.
+            }
+        }
         let mut stmt = conn.prepare(
             "SELECT * FROM memories WHERE scope_key = ?1 AND content LIKE ?2 ESCAPE '\\' ORDER BY access_count DESC, created_at DESC LIMIT ?3"
         ).map_err(|e| Error::Store(e.to_string()))?;
@@ -1485,43 +1598,8 @@ impl Store for SqliteStore {
             })
         }).map_err(|e| Error::Store(e.to_string()))?;
         let mut results = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| Error::Store(e.to_string()))?;
-        // Side-effect: record an access for every returned memory.
-        if !results.is_empty() {
-            let ids: Vec<String> = results.iter().map(|m| m.id.clone()).collect();
-            // Ids bind to ?1..?k; accessed_at binds to the trailing ?k+1.
-            let placeholders = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
-            let sql = format!(
-                "UPDATE memories SET access_count = access_count + 1, accessed_at = ?{n} WHERE id IN ({placeholders})",
-                n = ids.len() + 1
-            );
-            let now = chrono::Utc::now().to_rfc3339();
-            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 1);
-            for id in &ids {
-                params.push(id);
-            }
-            params.push(&now);
-            conn.execute(&sql, params.as_slice()).map_err(|e| Error::Store(e.to_string()))?;
-            // Returned rows must reflect post-bump state.
-            for m in &mut results {
-                m.access_count += 1;
-            }
-        }
+        bump_memory_access(&conn, &mut results)?;
         Ok(results)
-    }
-
-    async fn update_memory(&self, id: &str, new_content: &str, new_hash: &str) -> Result<()> {
-        let conn = self.writer_conn();
-        conn.execute(
-            "UPDATE memories SET content = ?1, content_hash = ?2, accessed_at = ?3 WHERE id = ?4",
-            rusqlite::params![new_content, new_hash, chrono::Utc::now().to_rfc3339(), id],
-        ).map_err(|e| Error::Store(e.to_string()))?;
-        Ok(())
-    }
-
-    async fn delete_memory(&self, id: &str) -> Result<bool> {
-        let conn = self.writer_conn();
-        let n = conn.execute("DELETE FROM memories WHERE id = ?1", [id]).map_err(|e| Error::Store(e.to_string()))?;
-        Ok(n > 0)
     }
 
     async fn list_promotable_memories(&self, limit: i64) -> Result<Vec<crate::services::memory::AgentMemory>> {
@@ -1593,7 +1671,7 @@ impl Store for SqliteStore {
             [rel_path],
             |row| row.get(0),
         ).map_err(|e| Error::Store(e.to_string()))?;
-        let id = format!("rev-{}", &ulid::Ulid::new().to_string()[..12]);
+        let id = format!("rev-{}", ulid::Ulid::new());
         conn.execute(
             "INSERT INTO document_revisions (id, rel_path, seq, hash, body, source, operation, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             rusqlite::params![id, rel_path, seq, hash, body, Some(source), operation, chrono::Utc::now().to_rfc3339()],
@@ -1896,6 +1974,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_memories_matches_paraphrased_terms_via_fts() {
+        let store = make_store().await;
+        store.insert_memory("u|a|", "semantic", "payment-api processes transactions via Stripe", "h1", None, None, None).await.unwrap();
+        store.insert_memory("u|a|", "semantic", "user-database is a PostgreSQL instance in us-east-1", "h2", None, None, None).await.unwrap();
+
+        // Multi-word query whose word ORDER differs from the content —
+        // substring LIKE would miss this; term FTS must find it.
+        let hits = store.search_memories("u|a|", "Stripe transactions", 5).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].content.contains("payment-api"));
+
+        // Terms scattered across the sentence.
+        let hits = store.search_memories("u|a|", "postgresql east-1 instance", 5).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].content.contains("PostgreSQL"));
+
+        // update_memory must refresh the FTS row: old terms gone, new found.
+        let id = hits[0].id.clone();
+        store.update_memory(&id, "now serving clickhouse analytics", "h3").await.unwrap();
+        let stale = store.search_memories("u|a|", "PostgreSQL", 5).await.unwrap();
+        assert!(stale.iter().all(|m| m.id != id), "stale terms must not match after update");
+        let fresh = store.search_memories("u|a|", "clickhouse analytics", 5).await.unwrap();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].id, id);
+
+        // delete_memory removes the FTS row too.
+        store.delete_memory(&id).await.unwrap();
+        let gone = store.search_memories("u|a|", "clickhouse", 5).await.unwrap();
+        assert!(gone.is_empty());
+    }
+
+    #[tokio::test]
     async fn search_memories_escapes_wildcards_bumps_and_orders() {
         let store = make_store().await;
         store.insert_memory("u|a|", "semantic", "100% done_thing", "h1", None, None, None).await.unwrap();
@@ -1920,9 +2030,13 @@ mod tests {
         assert_eq!(plain[0].source_session_id.as_deref(), Some("sess-1"));
         assert_eq!(plain[0].source_ref.as_deref(), Some("/w/a.md"));
 
-        // Backslash itself is escaped too.
-        let none = store.search_memories("u|a|", "100\\%", 10).await.unwrap();
-        assert!(none.is_empty());
+        // Under FTS, % and _ are inert characters rather than wildcards:
+        // the query degrades to its alphanumeric terms and still matches
+        // literally. (Parameterized SQL + fts_query sanitization means no
+        // injection surface either way.)
+        let literal = store.search_memories("u|a|", "100\\%", 10).await.unwrap();
+        assert_eq!(literal.len(), 1);
+        assert_eq!(literal[0].content, "100% done_thing");
     }
 
     #[tokio::test]

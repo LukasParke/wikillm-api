@@ -461,7 +461,7 @@ impl ImproverService {
 
 /// `mm-` + 12-char ulid-style suffix (matches the `wh-`/`sess-` id pattern).
 fn new_mutation_id() -> String {
-    format!("mm-{}", &ulid::Ulid::new().to_string()[..12].to_lowercase())
+    format!("mm-{}", ulid::Ulid::new().to_string().to_lowercase())
 }
 
 /// Staleness predicate: a document is due for refresh when it carries a
