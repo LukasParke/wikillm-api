@@ -165,11 +165,11 @@ def main():
         ("Deploy checklist: run tests, build Docker image, push to registry, update K8s", "procedural"),
     ]
 
-    # Store all facts
+    # Store all facts via the real ledger API (scoped to the bench agent).
     store_latencies = []
     for content, mem_type in facts:
         _, ms = timed(lambda c=content, t=mem_type: http("POST", f"{base}/v1/memory",
-            headers=H, body={"scope": {"user_id": "bench"}, "type": t, "content": c}))
+            headers=H, body={"content": c, "memory_type": t, "agent_name": "bench"}))
         store_latencies.append(ms)
     store_latencies.sort()
     bench.record("memory", "store_latency_p50_ms", value=round(store_latencies[len(store_latencies)//2], 2))
@@ -185,9 +185,9 @@ def main():
     recall_latencies = []
     for query, expected_idx in recall_tests:
         expected = facts[expected_idx][0][:40].lower()
-        _, ms = timed(lambda q=query: http("GET", f"{base}/v1/memory/search?scope_key=bench&query={urllib.parse.quote(query)}&limit=5", headers=H))
+        _, ms = timed(lambda q=query: http("GET", f"{base}/v1/memory?agent=bench&q={urllib.parse.quote(query)}&limit=5", headers=H))
         recall_latencies.append(ms)
-        st, resp = http("GET", f"{base}/v1/memory/search?scope_key=bench&query={urllib.parse.quote(query)}&limit=5", headers=H)
+        st, resp = http("GET", f"{base}/v1/memory?agent=bench&q={urllib.parse.quote(query)}&limit=5", headers=H)
         memories = resp.get("memories", []) if isinstance(resp, dict) else []
         found = any(expected in m.get("content", "").lower() for m in memories)
         if found: correct += 1
@@ -239,13 +239,15 @@ def main():
     # =====================================================================
     print("[5/6] Retrieval Quality (Precision/Recall/MRR)...")
 
+    # Query the corpus this script actually seeds (topic/entity-index paths).
+    # Paths follow the seed loop: topics[i % 10] / entities[i % 8]-{i}.md.
     quality_tests = [
-        ("auth service JWT", "wiki/services/auth-service.md"),
-        ("payment Stripe transaction", "wiki/services/payment-api.md"),
-        ("database PostgreSQL credentials", "wiki/infra/user-database.md"),
-        ("auth outage runbook escalation", "wiki/runbooks/auth-outage.md"),
-        ("JWT token expiration RS256", "wiki/concepts/jwt.md"),
-        ("database failover retry logic", "wiki/incidents/db-failover.md"),
+        ("auth-service authentication handles ecosystem", "wiki/authentication/auth-service-0.md"),
+        ("payment-api database handles ecosystem", "wiki/database/payment-api-1.md"),
+        ("user-database deployment handles ecosystem", "wiki/deployment/user-database-2.md"),
+        ("cache-cluster monitoring handles ecosystem", "wiki/monitoring/cache-cluster-3.md"),
+        ("message-queue security handles ecosystem", "wiki/security/message-queue-4.md"),
+        ("search-api networking handles ecosystem", "wiki/networking/search-api-5.md"),
     ]
 
     precisions, recalls, mrrs = [], [], []

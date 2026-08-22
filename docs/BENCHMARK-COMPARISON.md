@@ -48,6 +48,30 @@ expect +5–15% recall for queries that benefit from neighboring context.
 
 ---
 
+## 2026-08-22 A/B — Foundation-derived memory loop (pre `51787dc` vs post `62a0abf`)
+
+Isolated sequential A/B (fresh DB per binary, warmup pass discarded, identical
+harness/corpus). Full tables in `rust/scripts/benchmark-results.md`.
+
+| Endpoint (p50) | pre | post | delta |
+|---|---:|---:|---|
+| health | 0.17ms | 0.15ms | −12% |
+| search FTS | 0.63ms | 0.55ms | −13% |
+| documents list | 0.22ms | 0.16ms | −27% |
+| changes feed | 0.34ms | 0.29ms | −15% |
+
+- Retrieval quality **identical** on both binaries: R@10 93.8%, factoid R@10 100%.
+- New memory/versioning/community surfaces all serve at p50 ≤ 0.32ms
+  (2.5k–6.4k req/s); see new-surface table in benchmark-results.md.
+- Memory-knowledge recall on a pristine instance: **100% across all six
+  dimensions** (<1ms avg). Known ceiling: memory search is substring-LIKE;
+  paraphrased probes miss (25% on adversarial multi-word queries in
+  final_benchmark). FTS-indexing the memories table is the follow-up.
+- Write path now also records an append-only revision per mutation; no
+  regression was measurable at the harness's resolution.
+
+---
+
 ## Comparison against published systems
 
 ### Retrieval quality on multi-hop benchmarks
