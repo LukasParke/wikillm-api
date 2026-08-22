@@ -130,6 +130,16 @@ pub trait Store: Send + Sync {
     async fn set_setting(&self, key: &str, value: &Value, updated_by: &str) -> Result<()>;
     async fn delete_setting(&self, key: &str) -> Result<bool>;
 
+    // Agent memory ledger
+    async fn insert_memory(&self, scope_key: &str, memory_type: &str, content: &str, content_hash: &str) -> Result<()>;
+    async fn search_memories(&self, scope_key: &str, query: &str, limit: i64) -> Result<Vec<crate::services::memory::AgentMemory>>;
+    async fn update_memory(&self, id: &str, new_content: &str, new_hash: &str) -> Result<()>;
+    async fn delete_memory(&self, id: &str) -> Result<bool>;
+
+    // Knowledge graph entities
+    async fn upsert_entity(&self, id: &str, name: &str, entity_type: &str, source_doc: &str) -> Result<()>;
+    async fn list_entities(&self) -> Result<Vec<crate::services::kg::Entity>>;
+
     // Maintenance
     async fn delete_derived_for_origin(&self, origin: &str) -> Result<()>;
 }

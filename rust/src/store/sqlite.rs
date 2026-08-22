@@ -187,6 +187,28 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY, value TEXT NOT NULL,
   updated_at TEXT NOT NULL, updated_by TEXT
 );
+CREATE TABLE IF NOT EXISTS memories (
+  id TEXT PRIMARY KEY,
+  scope_key TEXT NOT NULL,
+  memory_type TEXT NOT NULL DEFAULT 'semantic',
+  content TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  accessed_at TEXT NOT NULL,
+  access_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope_key);
+CREATE INDEX IF NOT EXISTS idx_memories_hash ON memories(content_hash);
+
+CREATE TABLE IF NOT EXISTS entities (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  entity_type TEXT NOT NULL,
+  summary TEXT,
+  first_seen TEXT NOT NULL,
+  source_doc TEXT
+);
+
 CREATE TABLE IF NOT EXISTS api_keys (
   name TEXT PRIMARY KEY,
   key_hash TEXT NOT NULL UNIQUE,
@@ -1271,6 +1293,81 @@ impl Store for SqliteStore {
                 .map_err(|e| Error::Store(e.to_string()))?,
         };
         Ok((count, max_mtime))
+    }
+
+    async fn insert_memory(&self, scope_key: &str, memory_type: &str, content: &str, content_hash: &str) -> Result<()> {
+        let conn = self.writer_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO memories (id, scope_key, memory_type, content, content_hash, created_at, accessed_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            rusqlite::params![ulid::Ulid::new().to_string(), scope_key, memory_type, content, content_hash, now, now],
+        ).map_err(|e| Error::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn search_memories(&self, scope_key: &str, query: &str, limit: i64) -> Result<Vec<crate::services::memory::AgentMemory>> {
+        let conn = self.writer_conn();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM memories WHERE scope_key = ?1 AND content LIKE ?2 ORDER BY access_count DESC LIMIT ?3"
+        ).map_err(|e| Error::Store(e.to_string()))?;
+        let pattern = format!("%{query}%");
+        let rows = stmt.query_map(rusqlite::params![scope_key, pattern, limit], |row| {
+            Ok(crate::services::memory::AgentMemory {
+                id: row.get("id")?,
+                scope_key: row.get("scope_key")?,
+                memory_type: match row.get::<_, String>("memory_type")?.as_str() {
+                    "episodic" => crate::services::memory::MemoryType::Episodic,
+                    "procedural" => crate::services::memory::MemoryType::Procedural,
+                    _ => crate::services::memory::MemoryType::Semantic,
+                },
+                content: row.get("content")?,
+                created_at: row.get("created_at")?,
+                accessed_at: row.get("accessed_at")?,
+                access_count: row.get("access_count")?,
+            })
+        }).map_err(|e| Error::Store(e.to_string()))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| Error::Store(e.to_string()))
+    }
+
+    async fn update_memory(&self, id: &str, new_content: &str, new_hash: &str) -> Result<()> {
+        let conn = self.writer_conn();
+        conn.execute(
+            "UPDATE memories SET content = ?1, content_hash = ?2, accessed_at = ?3 WHERE id = ?4",
+            rusqlite::params![new_content, new_hash, chrono::Utc::now().to_rfc3339(), id],
+        ).map_err(|e| Error::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn delete_memory(&self, id: &str) -> Result<bool> {
+        let conn = self.writer_conn();
+        let n = conn.execute("DELETE FROM memories WHERE id = ?1", [id]).map_err(|e| Error::Store(e.to_string()))?;
+        Ok(n > 0)
+    }
+
+    async fn upsert_entity(&self, id: &str, name: &str, entity_type: &str, source_doc: &str) -> Result<()> {
+        let conn = self.writer_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO entities (id, name, entity_type, first_seen, source_doc) VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(name) DO UPDATE SET source_doc=excluded.source_doc",
+            rusqlite::params![id, name, entity_type, now, source_doc],
+        ).map_err(|e| Error::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_entities(&self) -> Result<Vec<crate::services::kg::Entity>> {
+        let conn = self.writer_conn();
+        let mut stmt = conn.prepare("SELECT * FROM entities ORDER BY name").map_err(|e| Error::Store(e.to_string()))?;
+        let rows = stmt.query_map([], |row| {
+            Ok(crate::services::kg::Entity {
+                id: row.get("id")?,
+                name: row.get("name")?,
+                entity_type: row.get("entity_type")?,
+                summary: row.get("summary")?,
+                first_seen: row.get("first_seen")?,
+            })
+        }).map_err(|e| Error::Store(e.to_string()))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| Error::Store(e.to_string()))
     }
 
     async fn replace_chunk_distilled(&self, chunk_id: &str, distilled: Option<Distilled>) -> Result<()> {

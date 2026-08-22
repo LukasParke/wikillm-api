@@ -5,7 +5,6 @@ use crate::domain::*;
 use crate::error::{Error, Result};
 use crate::store::{fts_query, Store};
 use async_trait::async_trait;
-use pgvector::Vector;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -218,6 +217,9 @@ impl Store for PostgresStore {
             "CREATE TABLE IF NOT EXISTS feedback (id TEXT PRIMARY KEY, query_id TEXT NOT NULL, helpful BOOLEAN NOT NULL, comment TEXT, created_at TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS webhooks (id TEXT PRIMARY KEY, url TEXT NOT NULL, events JSONB NOT NULL DEFAULT '[\"change\"]', prefixes JSONB NOT NULL DEFAULT '[\"*\"]', enabled BOOLEAN NOT NULL DEFAULT TRUE, last_status TEXT, last_attempt_at TEXT, created_at TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value JSONB NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT)",
+            "CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY, scope_key TEXT NOT NULL, memory_type TEXT NOT NULL DEFAULT \'semantic\', content TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL, accessed_at TEXT NOT NULL, access_count INTEGER NOT NULL DEFAULT 0)",
+            "CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope_key)",
+            "CREATE TABLE IF NOT EXISTS entities (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, entity_type TEXT NOT NULL, summary TEXT, first_seen TEXT NOT NULL, source_doc TEXT)",
             "CREATE TABLE IF NOT EXISTS api_keys (name TEXT PRIMARY KEY, key_hash TEXT NOT NULL UNIQUE, key_prefix TEXT NOT NULL, scope JSONB NOT NULL DEFAULT '[\"*\"]', role TEXT NOT NULL DEFAULT 'write', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, created_by TEXT)",
         ];
         for stmt in ddl {
@@ -749,6 +751,75 @@ impl Store for PostgresStore {
     async fn delete_derived_for_origin(&self, origin: &str) -> Result<()> {
         self.execute("DELETE FROM documents WHERE origin = $1", &[&origin]).await?;
         Ok(())
+    }
+
+    async fn insert_memory(&self, scope_key: &str, memory_type: &str, content: &str, content_hash: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.execute(
+            "INSERT INTO memories (id, scope_key, memory_type, content, content_hash, created_at, accessed_at) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            &[&ulid::Ulid::new().to_string(), &scope_key.to_string(), &memory_type.to_string(), &content.to_string(), &content_hash.to_string(), &now, &now],
+        ).await?;
+        Ok(())
+    }
+
+    async fn search_memories(&self, scope_key: &str, query: &str, limit: i64) -> Result<Vec<crate::services::memory::AgentMemory>> {
+        let pattern = format!("%{query}%");
+        let rows = self.query(
+            "SELECT * FROM memories WHERE scope_key = $1 AND content LIKE $2 ORDER BY access_count DESC LIMIT $3",
+            &[&scope_key.to_string(), &pattern, &limit],
+        ).await?;
+        Ok(rows.iter().filter_map(|row| {
+            let mt: String = row.get("memory_type");
+            Some(crate::services::memory::AgentMemory {
+                id: row.get("id"),
+                scope_key: row.get("scope_key"),
+                memory_type: match mt.as_str() {
+                    "episodic" => crate::services::memory::MemoryType::Episodic,
+                    "procedural" => crate::services::memory::MemoryType::Procedural,
+                    _ => crate::services::memory::MemoryType::Semantic,
+                },
+                content: row.get("content"),
+                created_at: row.get("created_at"),
+                accessed_at: row.get("accessed_at"),
+                access_count: row.get::<_, Option<i64>>("access_count").unwrap_or(0),
+            })
+        }).collect())
+    }
+
+    async fn update_memory(&self, id: &str, new_content: &str, new_hash: &str) -> Result<()> {
+        self.execute(
+            "UPDATE memories SET content = $1, content_hash = $2, accessed_at = $3 WHERE id = $4",
+            &[&new_content.to_string(), &new_hash.to_string(), &chrono::Utc::now().to_rfc3339(), &id.to_string()],
+        ).await?;
+        Ok(())
+    }
+
+    async fn delete_memory(&self, id: &str) -> Result<bool> {
+        let n = self.execute("DELETE FROM memories WHERE id = $1", &[&id.to_string()]).await?;
+        Ok(n > 0)
+    }
+
+    async fn upsert_entity(&self, id: &str, name: &str, entity_type: &str, source_doc: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.execute(
+            "INSERT INTO entities (id, name, entity_type, first_seen, source_doc) VALUES ($1,$2,$3,$4,$5)
+             ON CONFLICT(name) DO UPDATE SET source_doc=$5",
+            &[&id.to_string(), &name.to_string(), &entity_type.to_string(), &now, &source_doc.to_string()],
+        ).await?;
+        Ok(())
+    }
+
+    async fn list_entities(&self) -> Result<Vec<crate::services::kg::Entity>> {
+        let rows = self.query("SELECT * FROM entities ORDER BY name", &[]).await?;
+        Ok(rows.iter().filter_map(|row| {
+            Some(crate::services::kg::Entity {
+                id: row.get("id"),
+                name: row.get("name"),
+                entity_type: row.get("entity_type"),
+                summary: row.get("summary"),
+                first_seen: row.get("first_seen"),
+            })
+        }).collect())
     }
 
     async fn replace_chunk_distilled(&self, chunk_id: &str, distilled: Option<Distilled>) -> Result<()> {
