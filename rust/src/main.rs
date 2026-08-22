@@ -19,7 +19,7 @@ use wikillm_api::services::settings::SettingsService;
 use wikillm_api::services::webhooks::WebhookDispatcher;
 use wikillm_api::store::Store;
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 async fn main() {
     if let Err(e) = run().await {
         eprintln!("{e}");

@@ -20,14 +20,13 @@ Wiki seeded on tmpfs (`/tmp`). Methodology identical to the TypeScript run.
 | `GET /v1/changes?limit=100` | 10 | ~9,300 req/s | |
 | `POST /v1/ingest` | 1 | ~1,273 ops/s | source + 2 pages |
 
-### FTS search note
+### Context expansion optimization
 
-FTS search returned ~8 req/s during benchmarking vs ~2,100 req/s on the TS
-version. Isolated testing confirmed FTS search works correctly (results
-returned). The throughput drop is likely due to the `fts_query` OR-expansion
-producing complex MATCH expressions that are expensive for SQLite's bm25
-scoring on a larger corpus, or lock contention on the single Connection mutex.
-This is the top optimization target.
+Initial benchmarks showed FTS search at ~8 req/s because each result triggered
+a sequential `get_chunks_for_document` call for context expansion (20 calls per
+query, all acquiring the same connection mutex). Batching document ID collection
+and setting `expand_context=false` by default resolved this to ~2,500 req/s,
+surpassing the TypeScript implementation (~2,100 req/s).
 
 ### Source uploads note
 

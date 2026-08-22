@@ -16,19 +16,6 @@ pub struct SqliteStore {
     next_reader: std::sync::atomic::AtomicUsize,
 }
 
-type ConnGuard<'a> = MutexGuard<'a, Connection>;
-
-/// Run a blocking rusqlite closure on the blocking thread pool.
-async fn blocking<T, F>(f: F) -> Result<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T> + Send + 'static,
-{
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| Error::Store(format!("spawn_blocking: {e}")))?
-}
-
 fn jstr(v: &Value) -> String {
     v.to_string()
 }

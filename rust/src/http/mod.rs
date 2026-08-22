@@ -807,8 +807,8 @@ async fn search_handler(
             q: q.q.clone(),
             limit: q.limit.unwrap_or(20) as usize,
             filters: Some(filters),
-            rerank: true,
-            expand_context: true,
+            rerank: false,
+            expand_context: false,
         })
         .await
         .map_err(|e| map_err(&e))?;

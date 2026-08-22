@@ -194,14 +194,46 @@ impl SearchService {
 
         let winners: Vec<Scored> = final_order.into_iter().take(opts.limit).collect();
 
+        // Batch-fetch context: collect unique document IDs, then build a
+        // chunk lookup map in a single pass instead of N sequential queries.
         let mut results = Vec::with_capacity(winners.len());
-        for winner in &winners {
-            let expanded = if opts.expand_context {
-                self.expand_context(winner).await?
-            } else {
-                None
-            };
-            results.push(to_search_hit(winner, expanded));
+        if opts.expand_context && !winners.is_empty() {
+            let mut doc_ids: Vec<String> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for w in &winners {
+                if seen.insert(w.hit.document_id.clone()) {
+                    doc_ids.push(w.hit.document_id.clone());
+                }
+            }
+            // Fetch all chunks per doc (sequential but only unique docs)
+            let mut chunk_map: std::collections::HashMap<String, Vec<crate::domain::ChunkRecord>> = std::collections::HashMap::new();
+            for doc_id in &doc_ids {
+                if let Ok(chunks) = self.store.get_chunks_for_document(doc_id).await {
+                    chunk_map.insert(doc_id.clone(), chunks);
+                }
+            }
+            for winner in &winners {
+                let expanded = chunk_map.get(&winner.hit.document_id).and_then(|chunks| {
+                    let idx = chunks.iter().position(|c| c.id == winner.hit.chunk_id)?;
+                    let mut neighbors = Vec::new();
+                    if idx > 0 {
+                        neighbors.push((chunks[idx-1].ordinal, chunks[idx-1].heading_path.clone(), chunks[idx-1].content.clone()));
+                    }
+                    if idx + 1 < chunks.len() {
+                        neighbors.push((chunks[idx+1].ordinal, chunks[idx+1].heading_path.clone(), chunks[idx+1].content.clone()));
+                    }
+                    if neighbors.is_empty() { None } else {
+                        Some(neighbors.into_iter().map(|(ordinal, heading_path, content)| {
+                            SearchHitContext { ordinal, heading_path, content }
+                        }).collect::<Vec<_>>())
+                    }
+                });
+                results.push(to_search_hit(winner, expanded.map(|v| v)));
+            }
+        } else {
+            for winner in &winners {
+                results.push(to_search_hit(winner, None));
+            }
         }
 
         Ok(SearchResult {
