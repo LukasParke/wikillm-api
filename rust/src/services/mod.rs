@@ -16,3 +16,4 @@ pub mod kg;
 pub mod raptor;
 pub mod ppr;
 pub mod communities;
+pub mod sessions;

@@ -125,6 +125,15 @@ pub trait Store: Send + Sync {
     /// Collection fingerprint for list ETags (count + max mtime).
     async fn collection_fingerprint(&self, prefix: Option<&str>) -> Result<(i64, i64)>;
 
+    // Sessions (conversation context)
+    async fn insert_session(&self, s: &crate::services::sessions::Session) -> Result<()>;
+    async fn get_session(&self, id: &str) -> Result<Option<crate::services::sessions::Session>>;
+
+    // Knowledge graph relations
+    async fn upsert_relation(&self, r: &crate::services::kg::RelationRecord) -> Result<()>;
+    async fn get_relations_for_entity(&self, entity_id: &str, limit: i64) -> Result<Vec<crate::services::kg::RelationRecord>>;
+    async fn invalidate_relations_for_entity(&self, entity_path: &str) -> Result<()>;
+
     // Runtime settings
     async fn get_settings(&self) -> Result<Value>;
     async fn set_setting(&self, key: &str, value: &Value, updated_by: &str) -> Result<()>;

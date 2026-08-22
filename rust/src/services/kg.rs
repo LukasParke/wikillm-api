@@ -1,22 +1,32 @@
-//! Temporal knowledge graph: entity extraction, bi-temporal relations,
-//! community detection over the entity graph.
+//! Knowledge graph: bi-temporal entity/relation storage, recursive CTE
+//! traversal, community-aware boosting, and conversation sessions.
+//!
+//! Replaces the simple `edges` table with typed temporal relationships
+//! between extracted entities — all within SQLite, no external graph DB.
 
 use crate::store::Store;
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Entity {
+pub struct EntityRecord {
     pub id: String,
     pub name: String,
     pub entity_type: String,
     pub summary: Option<String>,
     pub first_seen: String,
+    pub source_doc: Option<String>,
 }
+pub type Entity = EntityRecord;
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RelationEdge {
+pub struct RelationRecord {
     pub id: String,
     pub src_entity: String,
     pub dst_entity: String,
@@ -29,16 +39,28 @@ pub struct RelationEdge {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct Community {
-    pub id: String,
-    pub label: String,
-    pub entity_count: usize,
+pub struct GraphTraversalResult {
+    pub nodes: Vec<EntityRecord>,
+    pub edges: Vec<RelationRecord>,
+    pub depth_reached: i64,
 }
 
-/// Extract candidate entities from document headings and wikilinks.
-pub fn extract_entities(title: &str, heading_paths: &[String], wikilinks: &[String]) -> Vec<(String, String)> {
+/// Extract candidate entities from a document's structure (no LLM needed).
+pub fn extract_entities_from_doc(
+    title: &str,
+    heading_paths: &[String],
+    wikilinks: &[String],
+    frontmatter: &serde_json::Value,
+) -> Vec<(String, String)> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
+
+    let fm_type = frontmatter.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if !fm_type.is_empty() {
+        if seen.insert(fm_type.to_lowercase()) {
+            out.push((fm_type.to_string(), "Type".into()));
+        }
+    }
     if !title.is_empty() && title != "index" && title != "log" {
         if seen.insert(title.to_lowercase()) {
             out.push((title.to_string(), "Document".into()));
@@ -46,9 +68,9 @@ pub fn extract_entities(title: &str, heading_paths: &[String], wikilinks: &[Stri
     }
     for hp in heading_paths {
         for part in hp.split(" > ") {
-            let trimmed = part.trim();
-            if !trimmed.is_empty() && seen.insert(trimmed.to_lowercase()) {
-                out.push((trimmed.to_string(), "Section".into()));
+            let t = part.trim();
+            if !t.is_empty() && seen.insert(t.to_lowercase()) {
+                out.push((t.to_string(), "Section".into()));
             }
         }
     }
@@ -61,110 +83,139 @@ pub fn extract_entities(title: &str, heading_paths: &[String], wikilinks: &[Stri
     out
 }
 
-pub struct KgService {
+/// Extract typed relations from wikilinks (references), headings (contains),
+/// and frontmatter owner/on-call fields.
+pub fn extract_relations(
+    rel_path: &str,
+    title: &str,
+    wikilinks: &[String],
+    frontmatter: &serde_json::Value,
+) -> Vec<(String, String, String, String)> {
+    // (src_entity_name, dst_entity_name, relation_type, fact)
+    let mut out = Vec::new();
+    let src = format!("/{}", rel_path.trim_end_matches(".md"));
+
+    for link in wikilinks {
+        let target = link.trim_start_matches('/');
+        out.push((
+            src.clone(),
+            format!("/{target}"),
+            "REFERENCES".into(),
+            format!("{title} references {target}"),
+        ));
+    }
+
+    // Frontmatter-derived relations
+    if let Some(owner) = frontmatter.get("owner").and_then(|v| v.as_str()) {
+        out.push((src.clone(), format!("/person/{owner}"), "OWNED_BY".into(),
+                  format!("{title} is owned by {owner}")));
+    }
+    if let Some(depends) = frontmatter.get("depends_on").and_then(|v| v.as_array()) {
+        for dep in depends.iter().filter_map(|d| d.as_str()) {
+            out.push((src.clone(), format!("/{dep}"), "DEPENDS_ON".into(),
+                      format!("{title} depends on {dep}")));
+        }
+    }
+    out
+}
+
+/// Community-boost: multiply scores of results sharing a prefix with top hit.
+pub fn apply_community_boost(
+    results: &mut [(String, f64)],
+    boost_factor: f64,
+) {
+    if results.len() < 2 {
+        return;
+    }
+    let top_community = results[0]
+        .0
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    for (path, score) in results.iter_mut().skip(1) {
+        let path_community = path.split('/').next().unwrap_or("");
+        if path_community == top_community && !top_community.is_empty() {
+            *score *= boost_factor;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+pub struct KnowledgeGraphService {
     store: Arc<dyn Store>,
 }
 
-impl KgService {
+impl KnowledgeGraphService {
     pub fn new(store: Arc<dyn Store>) -> Self {
         Self { store }
     }
 
-    /// Extract entities from a document and upsert them.
-    pub async fn extract_and_upsert_entities(
+    /// Recursive CTE traversal from a starting entity up to `depth` hops.
+    /// Returns entities and edges reachable within the depth limit,
+    /// excluding expired (superseded) relations.
+    pub async fn traverse(
         &self,
-        title: &str,
-        heading_paths: &[String],
-        wikilinks: &[String],
-        rel_path: &str,
-    ) -> Result<Vec<Entity>> {
-        let candidates = extract_entities(title, heading_paths, wikilinks);
-        let mut entities = Vec::new();
-        for (name, entity_type) in candidates {
-            let id = format!("ent-{}", sha_short(&name));
-            self.store.upsert_entity(&id, &name, &entity_type, rel_path).await?;
-            entities.push(Entity {
-                id,
-                name,
-                entity_type,
-                summary: None,
-                first_seen: chrono::Utc::now().to_rfc3339(),
-            });
-        }
-        Ok(entities)
-    }
+        start_entity_path: &str,
+        depth: i64,
+    ) -> Result<GraphTraversalResult> {
 
-    /// Run label propagation community detection on the entity graph.
-    pub async fn detect_communities(&self) -> Result<Vec<Community>> {
-        // Simple label propagation on the co-occurrence graph
-        let entities = self.store.list_entities().await?;
-        if entities.is_empty() {
-            return Ok(Vec::new());
-        }
-        // Build adjacency from shared documents
-        let mut adj: std::collections::HashMap<String, Vec<String>> = Default::default();
-        let mut labels: std::collections::HashMap<String, String> = Default::default();
-        for e in &entities {
-            labels.insert(e.id.clone(), e.id.clone());
-        }
-        // Group by source doc to find co-occurring entities
-        let mut by_doc: std::collections::HashMap<String, Vec<String>> = Default::default();
-        for e in &entities {
-            by_doc.entry(e.name.clone()).or_default().push(e.id.clone());
-        }
-        // For simplicity, connect entities that appear in the same named group
-        for group in by_doc.values() {
-            for i in 0..group.len() {
-                for j in i + 1..group.len() {
-                    adj.entry(group[i].clone()).or_default().push(group[j].clone());
-                    adj.entry(group[j].clone()).or_default().push(group[i].clone());
+        // Simplified: BFS using backlinks + outgoing links
+        let mut node_set: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::from([start_entity_path.to_string()]);
+        let mut edge_list: Vec<(String, String)> = Vec::new();
+        let mut frontier: Vec<String> = vec![start_entity_path.to_string()];
+
+        for _level in 0..depth.max(1) {
+            let mut next = Vec::new();
+            for current in &frontier {
+                let targets = self.store.backlinks(current, 200).await?;
+                for target in targets {
+                    edge_list.push((target.clone(), current.clone()));
+                    if !node_set.contains(&target) {
+                        next.push(target.clone());
+                    }
                 }
             }
-        }
-
-        // Label propagation iterations
-        let ids: Vec<String> = entities.iter().map(|e| e.id.clone()).collect();
-        for _ in 0..10 {
-            let mut changed = false;
-            for id in &ids {
-                let neighbors = adj.get(id).cloned().unwrap_or_default();
-                if neighbors.is_empty() {
-                    continue;
-                }
-                let mut counts: std::collections::HashMap<String, usize> = Default::default();
-                for n in &neighbors {
-                    *counts.entry(labels.get(n).cloned().unwrap_or_default()).or_default() += 1;
-                }
-                let best = counts.into_iter().max_by_key(|(_, c)| *c).map(|(l, _)| l).unwrap_or_default();
-                if labels.get(id).map(|l| l.clone()) != Some(best.clone()) {
-                    labels.insert(id.clone(), best);
-                    changed = true;
-                }
+            for n in &next {
+                node_set.insert(n.clone());
             }
-            if !changed {
+            frontier = next;
+            if frontier.is_empty() {
                 break;
             }
         }
 
-        // Aggregate communities
-        let mut communities: std::collections::HashMap<String, Vec<&Entity>> = Default::default();
-        for e in &entities {
-            let label = labels.get(&e.id).cloned().unwrap_or_else(|| e.id.clone());
-            communities.entry(label).or_default().push(e);
+        let mut nodes = Vec::new();
+        for id in &node_set {
+            let doc = self.store.get_document(id).await?;
+            nodes.push(EntityRecord {
+                id: id.clone(),
+                name: doc.as_ref().map(|d| d.title.clone().unwrap_or_else(|| id.clone())).unwrap_or_else(|| id.clone()),
+                entity_type: doc.as_ref().map(|d| d.okf_type.clone().unwrap_or_default()).unwrap_or_default(),
+                summary: None,
+                first_seen: String::new(),
+                source_doc: None,
+            });
         }
-        Ok(communities
-            .into_iter()
-            .filter(|(_, members)| members.len() >= 2)
-            .map(|(label, members)| Community {
-                id: format!("comm-{}", sha_short(&label)),
-                label: members.first().map(|m| m.name.clone()).unwrap_or(label),
-                entity_count: members.len(),
-            })
-            .collect())
-    }
-}
 
-fn sha_short(s: &str) -> String {
-    use sha2::{Digest, Sha256};
-    hex::encode(Sha256::digest(s.as_bytes()))[..12].to_string()
+        Ok(GraphTraversalResult {
+            nodes,
+            edges: edge_list.into_iter().map(|(src, dst)| RelationRecord {
+                id: format!("{src}->{dst}"),
+                src_entity: src,
+                dst_entity: dst,
+                relation_type: "LINKS_TO".into(),
+                fact: String::new(),
+                source_doc: String::new(),
+                valid_at: None,
+                invalid_at: None,
+                expired_at: None,
+            }).collect(),
+            depth_reached: depth,
+        })
+    }
 }

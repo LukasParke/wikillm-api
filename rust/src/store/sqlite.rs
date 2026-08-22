@@ -209,6 +209,29 @@ CREATE TABLE IF NOT EXISTS entities (
   source_doc TEXT
 );
 
+CREATE TABLE IF NOT EXISTS relation_edges (
+  id TEXT PRIMARY KEY,
+  src_entity TEXT NOT NULL,
+  dst_entity TEXT NOT NULL,
+  relation_type TEXT NOT NULL DEFAULT 'REFERENCES',
+  fact TEXT NOT NULL DEFAULT '',
+  source_doc TEXT NOT NULL,
+  valid_at TEXT,
+  invalid_at TEXT,
+  expired_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_rel_src ON relation_edges(src_entity);
+CREATE INDEX IF NOT EXISTS idx_rel_dst ON relation_edges(dst_entity);
+
+CREATE TABLE IF NOT EXISTS wiki_sessions (
+  id TEXT PRIMARY KEY,
+  agent_name TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  context_summary TEXT
+);
+
 CREATE TABLE IF NOT EXISTS api_keys (
   name TEXT PRIMARY KEY,
   key_hash TEXT NOT NULL UNIQUE,
@@ -1365,9 +1388,83 @@ impl Store for SqliteStore {
                 entity_type: row.get("entity_type")?,
                 summary: row.get("summary")?,
                 first_seen: row.get("first_seen")?,
+                source_doc: row.get("source_doc")?,
             })
         }).map_err(|e| Error::Store(e.to_string()))?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| Error::Store(e.to_string()))
+    }
+
+    async fn insert_session(&self, s: &crate::services::sessions::Session) -> Result<()> {
+        let conn = self.writer_conn();
+        conn.execute(
+            "INSERT INTO wiki_sessions (id, agent_name, user_id, created_at) VALUES (?1,?2,?3,?4)",
+            rusqlite::params![s.id, s.agent_name, s.user_id, s.created_at],
+        ).map_err(|e| Error::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_session(&self, id: &str) -> Result<Option<crate::services::sessions::Session>> {
+        let conn = self.writer_conn();
+        let mut stmt = conn.prepare("SELECT * FROM wiki_sessions WHERE id = ?1").map_err(|e| Error::Store(e.to_string()))?;
+        let mut rows = stmt.query([id]).map_err(|e| Error::Store(e.to_string()))?;
+        let session = match rows.next().map_err(|e| Error::Store(e.to_string()))? {
+            Some(row) => {
+                let s = (|| -> rusqlite::Result<crate::services::sessions::Session> {
+                    Ok(crate::services::sessions::Session {
+                        id: row.get("id")?,
+                        agent_name: row.get("agent_name")?,
+                        user_id: row.get("user_id")?,
+                        created_at: row.get("created_at")?,
+                        context_summary: row.get("context_summary")?,
+                    })
+                })()
+                .map_err(|e| Error::Store(e.to_string()))?;
+                Some(s)
+            }
+            None => None,
+        };
+        Ok(session)
+    }
+
+    async fn upsert_relation(&self, r: &crate::services::kg::RelationRecord) -> Result<()> {
+        let conn = self.writer_conn();
+        conn.execute(
+            "INSERT INTO relation_edges (id, src_entity, dst_entity, relation_type, fact, source_doc, valid_at, invalid_at, expired_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(id) DO UPDATE SET expired_at=excluded.expired_at",
+            rusqlite::params![r.id, r.src_entity, r.dst_entity, r.relation_type, r.fact, r.source_doc, r.valid_at, r.invalid_at, r.expired_at],
+        ).map_err(|e| Error::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_relations_for_entity(&self, entity_id: &str, limit: i64) -> Result<Vec<crate::services::kg::RelationRecord>> {
+        let conn = self.writer_conn();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM relation_edges WHERE (src_entity = ?1 OR dst_entity = ?1) AND expired_at IS NULL LIMIT ?2"
+        ).map_err(|e| Error::Store(e.to_string()))?;
+        let rows = stmt.query_map(rusqlite::params![entity_id, limit], |row| {
+            Ok(crate::services::kg::RelationRecord {
+                id: row.get("id")?,
+                src_entity: row.get("src_entity")?,
+                dst_entity: row.get("dst_entity")?,
+                relation_type: row.get("relation_type")?,
+                fact: row.get("fact")?,
+                source_doc: row.get("source_doc")?,
+                valid_at: row.get("valid_at")?,
+                invalid_at: row.get("invalid_at")?,
+                expired_at: row.get("expired_at")?,
+            })
+        }).map_err(|e| Error::Store(e.to_string()))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| Error::Store(e.to_string()))
+    }
+
+    async fn invalidate_relations_for_entity(&self, entity_path: &str) -> Result<()> {
+        let conn = self.writer_conn();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE relation_edges SET expired_at = ?1 WHERE source_doc = ?2",
+            rusqlite::params![now, entity_path],
+        ).map_err(|e| Error::Store(e.to_string()))?;
+        Ok(())
     }
 
     async fn replace_chunk_distilled(&self, chunk_id: &str, distilled: Option<Distilled>) -> Result<()> {

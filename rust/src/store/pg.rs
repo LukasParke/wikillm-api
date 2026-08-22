@@ -220,6 +220,10 @@ impl Store for PostgresStore {
             "CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY, scope_key TEXT NOT NULL, memory_type TEXT NOT NULL DEFAULT \'semantic\', content TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL, accessed_at TEXT NOT NULL, access_count INTEGER NOT NULL DEFAULT 0)",
             "CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope_key)",
             "CREATE TABLE IF NOT EXISTS entities (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, entity_type TEXT NOT NULL, summary TEXT, first_seen TEXT NOT NULL, source_doc TEXT)",
+            "CREATE TABLE IF NOT EXISTS relation_edges (id TEXT PRIMARY KEY, src_entity TEXT NOT NULL, dst_entity TEXT NOT NULL, relation_type TEXT NOT NULL DEFAULT \'REFERENCES\', fact TEXT NOT NULL DEFAULT \'\', source_doc TEXT NOT NULL, valid_at TEXT, invalid_at TEXT, expired_at TEXT, created_at TEXT NOT NULL DEFAULT (now()))",
+            "CREATE INDEX IF NOT EXISTS idx_rel_src ON relation_edges(src_entity)",
+            "CREATE INDEX IF NOT EXISTS idx_rel_dst ON relation_edges(dst_entity)",
+            "CREATE TABLE IF NOT EXISTS wiki_sessions (id TEXT PRIMARY KEY, agent_name TEXT NOT NULL, user_id TEXT NOT NULL, created_at TEXT NOT NULL, context_summary TEXT)",
             "CREATE TABLE IF NOT EXISTS api_keys (name TEXT PRIMARY KEY, key_hash TEXT NOT NULL UNIQUE, key_prefix TEXT NOT NULL, scope JSONB NOT NULL DEFAULT '[\"*\"]', role TEXT NOT NULL DEFAULT 'write', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, created_by TEXT)",
         ];
         for stmt in ddl {
@@ -818,8 +822,63 @@ impl Store for PostgresStore {
                 entity_type: row.get("entity_type"),
                 summary: row.get("summary"),
                 first_seen: row.get("first_seen"),
+                source_doc: row.get("source_doc"),
             })
         }).collect())
+    }
+
+    async fn insert_session(&self, s: &crate::services::sessions::Session) -> Result<()> {
+        self.execute(
+            "INSERT INTO wiki_sessions (id, agent_name, user_id, created_at) VALUES ($1,$2,$3,$4)",
+            &[&s.id.to_string(), &s.agent_name.to_string(), &s.user_id.to_string(), &s.created_at.to_string()],
+        ).await?;
+        Ok(())
+    }
+
+    async fn get_session(&self, id: &str) -> Result<Option<crate::services::sessions::Session>> {
+        let rows = self.query("SELECT * FROM wiki_sessions WHERE id = $1", &[&id.to_string()]).await?;
+        let row = match rows.first() { Some(r) => r, None => return Ok(None) };
+        Ok(Some(crate::services::sessions::Session {
+            id: row.get::<_, Option<String>>("id").unwrap_or_default(),
+            agent_name: row.get::<_, Option<String>>("agent_name").unwrap_or_default(),
+            user_id: row.get::<_, Option<String>>("user_id").unwrap_or_default(),
+            created_at: row.get::<_, Option<String>>("created_at").unwrap_or_default(),
+            context_summary: row.get("context_summary"),
+        }))
+    }
+
+    async fn upsert_relation(&self, r: &crate::services::kg::RelationRecord) -> Result<()> {
+        self.execute(
+            "INSERT INTO relation_edges (id, src_entity, dst_entity, relation_type, fact, source_doc, valid_at, invalid_at, expired_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(id) DO UPDATE SET expired_at=$9",
+            &[&r.id.to_string(), &r.src_entity.to_string(), &r.dst_entity.to_string(), &r.relation_type.to_string(), &r.fact.to_string(), &r.source_doc.to_string(), &r.valid_at.clone().unwrap_or_default(), &r.invalid_at.clone().unwrap_or_default(), &r.expired_at.clone().unwrap_or_default()],
+        ).await?;
+        Ok(())
+    }
+
+    async fn get_relations_for_entity(&self, entity_id: &str, limit: i64) -> Result<Vec<crate::services::kg::RelationRecord>> {
+        let rows = self.query(
+            "SELECT * FROM relation_edges WHERE (src_entity = $1 OR dst_entity = $1) AND expired_at IS NULL LIMIT $2",
+            &[&entity_id.to_string(), &limit],
+        ).await?;
+        Ok(rows.iter().map(|row| crate::services::kg::RelationRecord {
+            id: row.get::<_, Option<String>>("id").unwrap_or_default(),
+            src_entity: row.get::<_, Option<String>>("src_entity").unwrap_or_default(),
+            dst_entity: row.get::<_, Option<String>>("dst_entity").unwrap_or_default(),
+            relation_type: row.get::<_, Option<String>>("relation_type").unwrap_or_default(),
+            fact: row.get::<_, Option<String>>("fact").unwrap_or_default(),
+            source_doc: row.get::<_, Option<String>>("source_doc").unwrap_or_default(),
+            valid_at: row.get("valid_at"),
+            invalid_at: row.get("invalid_at"),
+            expired_at: row.get("expired_at"),
+        }).collect())
+    }
+
+    async fn invalidate_relations_for_entity(&self, entity_path: &str) -> Result<()> {
+        self.execute(
+            "UPDATE relation_edges SET expired_at = $1 WHERE source_doc = $2",
+            &[&chrono::Utc::now().to_rfc3339(), &entity_path.to_string()],
+        ).await?;
+        Ok(())
     }
 
     async fn replace_chunk_distilled(&self, chunk_id: &str, distilled: Option<Distilled>) -> Result<()> {
