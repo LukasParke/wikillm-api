@@ -126,12 +126,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_exposes_all_41_tools() {
+    async fn tools_list_exposes_all_53_tools() {
         let res = handle_line(&client(), r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
             .await
             .expect("reply expected");
         let tools = res["result"]["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 41);
+        assert_eq!(tools.len(), 53);
         for t in tools {
             assert!(!t["name"].as_str().unwrap_or_default().is_empty());
             assert!(t["inputSchema"].is_object());
@@ -162,10 +162,18 @@ mod tests {
         assert_eq!(res["error"]["code"], -32700);
     }
 
-    #[test]
-    fn registry_names_match_ts_reference() {
-        let names: Vec<&str> = tool_registry().into_iter().map(|t| t.name).collect();
-        assert_eq!(names.len(), 41);
+    #[tokio::test]
+    async fn registry_names_match_ts_reference() {
+        let res = handle_line(&client(), r#"{"jsonrpc":"2.0","id":9,"method":"tools/list"}"#)
+            .await
+            .expect("reply expected");
+        let names: Vec<String> = res["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(String::from))
+            .collect();
+        assert_eq!(names.len(), 53);
         for expected in [
             "search",
             "get_concept",
@@ -208,9 +216,22 @@ mod tests {
             "get_page_raw",
             "read_source_content",
             "okf_layout",
+            // wave-3 memory-loop extensions
+            "memory_store",
+            "memory_search",
+            "memory_history",
+            "session_start",
+            "session_message",
+            "session_get",
+            "page_versions",
+            "page_diff",
+            "gaps_report",
+            "communities_list",
+            "communities_docs",
+            "promote_run",
         ] {
             assert!(
-                names.contains(&expected),
+                names.contains(&expected.to_string()),
                 "missing tool in registry: {expected}"
             );
         }

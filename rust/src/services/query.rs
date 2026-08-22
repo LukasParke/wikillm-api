@@ -1,6 +1,7 @@
 //! Query service (plan → execute tools → synthesize), ported from TypeScript
 //! `src/services/queryService.ts`.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -10,17 +11,26 @@ use serde::Serialize;
 use crate::domain::{QueryRecord, SearchFilters};
 use crate::error::{Error, Result};
 use crate::llm::provider::DynLlmProvider;
-use crate::services::search::{SearchOptions, SearchService};
+use crate::services::crag::{self, RetrievalGrade};
+use crate::services::search::{
+    collapse_by_content, rrf_fuse, SearchOptions, SearchService, NEAR_DUP_JACCARD,
+};
+use crate::services::settings::SettingsService;
 use crate::store::Store;
 
 const PLANNER_SYSTEM: &str = "You plan retrieval for a knowledge-base service. \
 Available tools: search_pages (wiki + ingested docs), search_sources (raw source files), recent_changes (latest edits). \
 Given a question, respond with ONLY JSON: {\"tools\":[{\"name\":\"search_pages\",\"query\":\"...\"}]}. \
-Pick 1-3 tool calls with precise search queries. Prefer search_pages by default.";
+Pick 1-3 tool calls with precise search queries. Prefer search_pages by default. \
+For questions about current or latest state, plan queries that surface the most recently confirmed information.";
 
 const SYNTHESIS_SYSTEM: &str = "You answer questions strictly from the provided evidence. \
 Cite sources inline using their exact path in parentheses like (wiki/example.md). \
-If evidence is insufficient, say so plainly. Never invent facts.";
+If evidence is insufficient, say so plainly. Never invent facts. \
+Prefer the most recently confirmed fact when answering about current or latest state, \
+and compare older versus newer mentions across the evidence rather than stopping at the first hit.";
+
+const ABSTENTION_ANSWER: &str = "Not answerable from this knowledge base.";
 
 const KNOWN_TOOLS: [&str; 3] = ["search_pages", "search_sources", "recent_changes"];
 
@@ -55,6 +65,10 @@ pub struct QueryAnswer {
     pub evidence: Vec<EvidenceOut>,
     pub tools_used: Vec<ToolUse>,
     pub mode: String,
+    /// True when the CRAG retrieval guard gave up after its corrective round
+    /// and returned an abstention instead of grounded content.
+    #[serde(default)]
+    pub abstained: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -82,14 +96,21 @@ pub struct QueryService {
     store: Arc<dyn Store>,
     llm: LlmGetter,
     search: Arc<SearchService>,
+    settings: Arc<SettingsService>,
 }
 
 impl QueryService {
-    pub fn new(store: Arc<dyn Store>, llm: LlmGetter, search: Arc<SearchService>) -> Self {
+    pub fn new(
+        store: Arc<dyn Store>,
+        llm: LlmGetter,
+        search: Arc<SearchService>,
+        settings: Arc<SettingsService>,
+    ) -> Self {
         QueryService {
             store,
             llm,
             search,
+            settings,
         }
     }
 
@@ -120,7 +141,75 @@ impl QueryService {
             }];
         }
 
-        let evidence = self.execute_tools(&tools, filters).await;
+        let mut evidence = self.execute_tools(&tools, filters).await;
+        let mut corrective_tools: Vec<ToolPlanEntry> = Vec::new();
+        let mut abstained = false;
+
+        // CRAG corrective retrieval guard: grade the evidence before
+        // synthesis; on Incorrect run exactly one rewrite-and-re-retrieve
+        // round, and abstain when the merged evidence still grades Incorrect.
+        // Grading failures degrade gracefully to unguarded answering.
+        if matches!(self.settings.get_bool("retrieval_guard").await, Ok(true)) {
+            match self.grade_evidence(&llm, question, &evidence).await {
+                RetrievalGrade::Correct => {}
+                RetrievalGrade::Ambiguous => {
+                    self.expand_evidence_context(&mut evidence).await;
+                }
+                RetrievalGrade::Incorrect => {
+                    let rewritten = match crag::rewrite_query(&llm, question).await {
+                        Ok(raw) => {
+                            let trimmed = raw.trim().to_string();
+                            if trimmed.is_empty() {
+                                question.to_string()
+                            } else {
+                                trimmed
+                            }
+                        }
+                        Err(_) => question.to_string(),
+                    };
+                    let retry_tools: Vec<ToolPlanEntry> = tools
+                        .iter()
+                        .map(|tool| ToolPlanEntry {
+                            name: tool.name.clone(),
+                            query: rewritten.clone(),
+                        })
+                        .collect();
+                    let corrective = self.execute_tools(&retry_tools, filters).await;
+                    evidence = merge_evidence_rounds(evidence, corrective);
+                    corrective_tools = retry_tools;
+
+                    match self.grade_evidence(&llm, question, &evidence).await {
+                        RetrievalGrade::Incorrect => abstained = true,
+                        RetrievalGrade::Ambiguous => {
+                            self.expand_evidence_context(&mut evidence).await;
+                        }
+                        RetrievalGrade::Correct => {}
+                    }
+                }
+            }
+        }
+
+        if abstained {
+            let tools_used: Vec<ToolPlanEntry> =
+                tools.into_iter().chain(corrective_tools).collect();
+            self.record(question, source, &started, 0, true, Vec::new(), None)
+                .await;
+            return Ok(QueryAnswer {
+                answer: ABSTENTION_ANSWER.to_string(),
+                citations: Vec::new(),
+                evidence: Vec::new(),
+                tools_used: tools_used
+                    .into_iter()
+                    .map(|tool| ToolUse {
+                        name: tool.name,
+                        query: tool.query,
+                    })
+                    .collect(),
+                mode: "query".to_string(),
+                abstained: true,
+            });
+        }
+
         let citations: Vec<Citation> = evidence
             .iter()
             .take(8)
@@ -173,18 +262,29 @@ impl QueryService {
         {
             Ok(answer) => answer,
             Err(err) => {
-                self.record(question, source, &started, 0, false, Some(format!("{err}")))
-                    .await;
+                let top_paths = citation_top_paths(&citations);
+                self.record(
+                    question,
+                    source,
+                    &started,
+                    0,
+                    false,
+                    top_paths,
+                    Some(format!("{err}")),
+                )
+                .await;
                 return Err(err);
             }
         };
 
+        let top_paths = citation_top_paths(&citations);
         self.record(
             question,
             source,
             &started,
             evidence.len() as i64,
             evidence.is_empty(),
+            top_paths,
             None,
         )
         .await;
@@ -203,17 +303,75 @@ impl QueryService {
                 .collect(),
             tools_used: tools
                 .into_iter()
+                .chain(corrective_tools)
                 .map(|tool| ToolUse {
                     name: tool.name,
                     query: tool.query,
                 })
                 .collect(),
             mode: "query".to_string(),
+            abstained: false,
         })
     }
 
-    /// Promise.allSettled equivalent: run every planned tool concurrently and
-    /// keep only the fulfilled branches.
+    /// Grade the top evidence against the question via the CRAG grader.
+    /// A grading failure is treated as Correct so transient LLM errors never
+    /// block or wrongly abstain an otherwise answerable query.
+    async fn grade_evidence(
+        &self,
+        llm: &DynLlmProvider,
+        question: &str,
+        evidence: &[EvidenceItem],
+    ) -> RetrievalGrade {
+        let snippets: Vec<String> = evidence
+            .iter()
+            .take(8)
+            .map(|hit| truncate_chars(&hit.content, 500))
+            .collect();
+        match crag::grade_retrieval(llm, question, &snippets).await {
+            Ok(result) => result.grade,
+            Err(_) => RetrievalGrade::Correct,
+        }
+    }
+
+    /// CRAG corrective action for an Ambiguous grade: attach neighboring
+    /// chunk content to the top evidence items so synthesis sees wider
+    /// context around each partially-relevant hit.
+    async fn expand_evidence_context(&self, evidence: &mut [EvidenceItem]) {
+        for item in evidence.iter_mut().take(8) {
+            let Ok(Some(doc)) = self.store.get_document(&item.rel_path).await else {
+                continue;
+            };
+            let Ok(chunks) = self.store.get_chunks_for_document(&doc.id).await else {
+                continue;
+            };
+            let position = chunks.iter().position(|chunk| {
+                match &item.heading_path {
+                    Some(hp) => chunk.heading_path.as_deref() == Some(hp.as_str()),
+                    None => content_prefix_match(chunk.content.as_str(), &item.content),
+                }
+            });
+            let Some(index) = position else { continue };
+            let mut context: Vec<&str> = Vec::new();
+            if index > 0 {
+                context.push(chunks[index - 1].content.trim());
+            }
+            if index + 1 < chunks.len() {
+                context.push(chunks[index + 1].content.trim());
+            }
+            if context.is_empty() {
+                continue;
+            }
+            let joined = truncate_chars(&context.join("\n\n"), 800);
+            item.content.push_str("\n\n[context] ");
+            item.content.push_str(&joined);
+        }
+    }
+
+    /// Run every planned tool concurrently and fuse the fulfilled branches
+    /// with Reciprocal Rank Fusion (K=60) over `rel_path::heading_path` keys
+    /// so consensus across tools outranks any single list's top hits, then
+    /// collapse near-duplicates ahead of the caller's top-8 cut.
     async fn execute_tools(
         &self,
         tools: &[ToolPlanEntry],
@@ -221,20 +379,45 @@ impl QueryService {
     ) -> Vec<EvidenceItem> {
         let runs = tools.iter().map(|tool| self.run_tool(tool, filters));
         let settled = join_all(runs).await;
-        let merged: Vec<EvidenceItem> = settled
+
+        let mut lists: Vec<Vec<String>> = Vec::new();
+        let mut pool: HashMap<String, EvidenceItem> = HashMap::new();
+        for items in settled.into_iter().flatten() {
+            let mut list: Vec<String> = Vec::new();
+            for item in items {
+                let key = format!(
+                    "{}::{}",
+                    item.rel_path,
+                    item.heading_path.clone().unwrap_or_default()
+                );
+                let replace = match pool.get(&key) {
+                    Some(existing) => existing.score < item.score,
+                    None => true,
+                };
+                if replace {
+                    pool.insert(key.clone(), item);
+                }
+                if !list.contains(&key) {
+                    list.push(key);
+                }
+            }
+            if !list.is_empty() {
+                lists.push(list);
+            }
+        }
+
+        let fused: Vec<EvidenceItem> = rrf_fuse(&lists, 60)
             .into_iter()
-            .flatten()
-            .flat_map(|items| items.into_iter())
+            .filter_map(|(key, score)| {
+                let mut item = pool.remove(&key)?;
+                item.score = score;
+                Some(item)
+            })
             .collect();
 
-        // Dedupe by rel_path + heading_path, keeping the max score.
-        let mut best: index_map::IndexMap = index_map::IndexMap::new();
-        for item in merged {
-            best.keep_max(item);
-        }
-        let mut items: Vec<EvidenceItem> = best.into_items();
-        items.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        items
+        // RRF output is descending, so higher-scored entries survive the
+        // near-duplicate collapse.
+        collapse_by_content(fused, |item| item.content.as_str(), NEAR_DUP_JACCARD)
     }
 
     async fn run_tool(
@@ -304,6 +487,7 @@ impl QueryService {
         started: &Instant,
         result_count: i64,
         zero_hit: bool,
+        top_paths: Vec<String>,
         error: Option<String>,
     ) {
         let rec = QueryRecord {
@@ -315,12 +499,50 @@ impl QueryService {
             latency_ms: started.elapsed().as_millis() as f64,
             result_count,
             zero_hit,
-            top_paths: Vec::new(),
+            top_paths,
             source: source.map(str::to_string),
             error,
         };
         let _ = self.store.record_query(&rec).await;
     }
+}
+
+/// Deduplicated citation paths in citation order (for `queries.top_paths`).
+fn citation_top_paths(citations: &[Citation]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for citation in citations {
+        if seen.insert(citation.rel_path.clone()) {
+            paths.push(citation.rel_path.clone());
+        }
+    }
+    paths
+}
+
+/// Merge the original retrieval round with the corrective round, keeping the
+/// highest-scoring entry per `rel_path::heading_path` key.
+fn merge_evidence_rounds(primary: Vec<EvidenceItem>, corrective: Vec<EvidenceItem>) -> Vec<EvidenceItem> {
+    let mut best = index_map::IndexMap::new();
+    for item in primary.into_iter().chain(corrective) {
+        best.keep_max(item);
+    }
+    let mut items = best.into_items();
+    items.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    items
+}
+
+/// Loose chunk-to-evidence matching for heading-less items: compare a short
+/// normalized prefix of both contents (snippets are char-truncated copies).
+fn content_prefix_match(chunk_content: &str, evidence_content: &str) -> bool {
+    fn clean(s: &str) -> &str {
+        s.trim_end_matches('\u{2026}').trim()
+    }
+    let prefix = |s: &str| clean(s).chars().take(80).collect::<String>();
+    let chunk_prefix = prefix(chunk_content);
+    let evidence_prefix = prefix(evidence_content);
+    !chunk_prefix.is_empty()
+        && (chunk_content.starts_with(&evidence_prefix)
+            || clean(evidence_content).starts_with(&chunk_prefix))
 }
 
 fn parse_rfc3339_millis(value: &str) -> i64 {
@@ -428,4 +650,3 @@ mod index_map {
         }
     }
 }
-

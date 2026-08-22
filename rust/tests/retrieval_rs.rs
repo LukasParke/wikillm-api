@@ -93,3 +93,157 @@ fn planner_missing_query_defaults_to_empty_string() {
     assert_eq!(tools[0].name, "recent_changes");
     assert_eq!(tools[0].query, "");
 }
+
+use wikillm_api::domain::ChunkHit;
+use wikillm_api::services::search::{collapse_near_dups, Scored};
+
+fn scored(rel_path: &str, content: &str, score: f64) -> Scored {
+    Scored {
+        score,
+        hit: ChunkHit {
+            chunk_id: format!("{rel_path}#0"),
+            document_id: rel_path.to_string(),
+            rel_path: rel_path.to_string(),
+            kind: "wiki".to_string(),
+            origin: "wiki".to_string(),
+            title: None,
+            okf_type: None,
+            tags: Vec::new(),
+            status: None,
+            stale_after: None,
+            verified: None,
+            hash: "h".to_string(),
+            mtime: 0,
+            heading_path: None,
+            content: content.to_string(),
+            score,
+        },
+    }
+}
+
+#[test]
+fn near_dup_collapse_keeps_higher_scored_of_similar_pair() {
+    let hits = vec![
+        scored("a.md", "The deployment pipeline runs automated smoke tests before every rollout", 2.0),
+        scored("b.md", "the deployment pipeline runs automated smoke tests before every ROLLOUT", 1.5),
+        scored("c.md", "Kubernetes ingress controllers route external traffic to clustered services", 1.0),
+    ];
+    let out = collapse_near_dups(hits);
+    assert_eq!(out.len(), 2);
+    // Case/punctuation-only variant collapses into the higher-scored hit.
+    assert_eq!(out[0].hit.rel_path, "a.md");
+    assert_eq!(out[1].hit.rel_path, "c.md");
+}
+
+#[test]
+fn near_dup_collapse_is_order_independent() {
+    let hits = vec![
+        scored("low.md", "The deployment pipeline runs automated smoke tests before every rollout", 1.0),
+        scored("high.md", "The deployment pipeline runs automated smoke tests before every rollout!", 3.0),
+    ];
+    let out = collapse_near_dups(hits);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].hit.rel_path, "high.md");
+}
+
+#[test]
+fn partially_similar_contents_survive_collapse() {
+    let hits = vec![
+        scored("x.md", "alpha beta gamma delta epsilon", 2.0),
+        scored("y.md", "alpha beta gamma zeta eta theta", 1.9),
+    ];
+    // Overlap is one shared trigram out of six — well below the 0.8 cutoff.
+    assert_eq!(collapse_near_dups(hits).len(), 2);
+}
+
+// Draft exclusion (wave-2): pages with status 'draft' (e.g. promoter
+// output under derived/promotions/) stay out of search results unless
+// the caller explicitly filters for that status.
+
+use std::sync::Arc;
+
+use wikillm_api::domain::{ChunkInput, DocKind, DocumentInput, SearchFilters};
+use wikillm_api::store::sqlite::SqliteStore;
+use wikillm_api::store::Store;
+
+async fn make_draft_store() -> Arc<dyn Store> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let store = SqliteStore::open(path.to_str().unwrap()).unwrap();
+    store.migrate().await.unwrap();
+    std::mem::forget(dir);
+    Arc::new(store)
+}
+
+fn probe_doc(rel_path: &str, status: &str) -> DocumentInput {
+    DocumentInput {
+        rel_path: rel_path.to_string(),
+        kind: DocKind::Page,
+        origin: "wiki".into(),
+        title: Some("Promotion probe".into()),
+        summary: None,
+        body: "# Promotion probe\n\npromotedraftprobe fixture page.".into(),
+        frontmatter: serde_json::json!({"type": "concept"}),
+        word_count: 6,
+        outgoing_links: vec![],
+        hash: "a".repeat(64),
+        mtime: 1_700_000_000_000,
+        content_type: Some("text/markdown".into()),
+        okf_type: Some("Concept".into()),
+        tags: vec![],
+        status: Some(status.to_string()),
+        stale_after: None,
+        resource: None,
+        generated_by: Some("wikillm-promoter".into()),
+        generated_at: None,
+        verified: None,
+        provenance: None,
+        updated_at: None,
+        updated_by: None,
+    }
+}
+
+async fn seed_probe_chunk(store: &Arc<dyn Store>, rel_path: &str, content: &str) {
+    store.upsert_document(&probe_doc(rel_path, if rel_path.starts_with("derived/") { "draft" } else { "stable" })).await.unwrap();
+    let doc = store.get_document(rel_path).await.unwrap().unwrap();
+    store.replace_chunks(&doc.id, &[
+        ChunkInput { ordinal: 0, heading_path: Some("Promotion probe".into()), content: content.into(), distilled: None },
+    ]).await.unwrap();
+}
+
+#[tokio::test]
+async fn search_excludes_draft_pages_unless_status_requested() {
+    let store = make_draft_store().await;
+    seed_probe_chunk(&store, "wiki/promo/stable.md", "promotedraftprobe stable content.").await;
+    seed_probe_chunk(&store, "derived/promotions/deploy-pipeline.md", "promotedraftprobe draft content.").await;
+
+    // No filters object at all: drafts hidden.
+    let hits = store.search_fts("promotedraftprobe", 10, None).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].rel_path, "wiki/promo/stable.md");
+
+    // Filters present but without statuses: still hidden.
+    let hits = store.search_fts(
+        "promotedraftprobe",
+        10,
+        Some(&SearchFilters { origins: Some(vec!["wiki".into()]), ..Default::default() }),
+    ).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].rel_path, "wiki/promo/stable.md");
+
+    // Explicit statuses filter opts back into drafts.
+    let hits = store.search_fts(
+        "promotedraftprobe",
+        10,
+        Some(&SearchFilters { statuses: Some(vec!["draft".into()]), ..Default::default() }),
+    ).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].rel_path, "derived/promotions/deploy-pipeline.md");
+
+    let hits = store.search_fts(
+        "promotedraftprobe",
+        10,
+        Some(&SearchFilters { statuses: Some(vec!["draft".into(), "stable".into()]), ..Default::default() }),
+    ).await.unwrap();
+    assert_eq!(hits.len(), 2);
+}

@@ -3,7 +3,7 @@
 
 use crate::domain::*;
 use crate::error::{Error, Result};
-use crate::store::{fts_query, Store};
+use crate::store::{fts_query, DocumentRevision, MemoryMutation, Store, TranscriptWatermark, ZeroHitQuery};
 use async_trait::async_trait;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::Connection;
@@ -196,7 +196,11 @@ CREATE TABLE IF NOT EXISTS memories (
   content_hash TEXT NOT NULL,
   created_at TEXT NOT NULL,
   accessed_at TEXT NOT NULL,
-  access_count INTEGER NOT NULL DEFAULT 0
+  access_count INTEGER NOT NULL DEFAULT 0,
+  source_session_id TEXT,
+  source_ref TEXT,
+  promote_candidate INTEGER NOT NULL DEFAULT 0,
+  promoted_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope_key);
 CREATE INDEX IF NOT EXISTS idx_memories_hash ON memories(content_hash);
@@ -241,6 +245,40 @@ CREATE TABLE IF NOT EXISTS api_keys (
   role TEXT NOT NULL DEFAULT 'write',
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL, created_by TEXT
 );
+
+CREATE TABLE IF NOT EXISTS document_revisions (
+  id TEXT PRIMARY KEY,              -- 'rev-' + 12-char ulid-style
+  rel_path TEXT NOT NULL,
+  seq INTEGER NOT NULL,             -- monotonic per rel_path
+  hash TEXT NOT NULL,               -- sha256 of body
+  body TEXT NOT NULL,
+  source TEXT,                      -- actor string ('human:luke', 'agent-x/wikillm-api', ...)
+  operation TEXT NOT NULL,          -- 'create'|'update'|'delete'
+  created_at TEXT NOT NULL          -- RFC3339
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rev_path_seq ON document_revisions(rel_path, seq);
+CREATE INDEX IF NOT EXISTS idx_rev_path ON document_revisions(rel_path);
+
+CREATE TABLE IF NOT EXISTS memory_mutations (
+  id TEXT PRIMARY KEY,
+  memory_id TEXT NOT NULL,
+  action TEXT NOT NULL,             -- 'add'|'update'|'delete'|'noop'
+  old_content TEXT,
+  new_content TEXT,
+  timestamp TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mm_memory ON memory_mutations(memory_id);
+
+-- Coding-agent transcript watermarks (consumed by the transcript sync loop)
+CREATE TABLE IF NOT EXISTS transcript_watermarks (
+  tool TEXT NOT NULL,               -- 'claude'|'codex'|'cursor'
+  transcript_path TEXT NOT NULL,
+  last_line INTEGER NOT NULL DEFAULT 0,
+  prefix_hash TEXT,                 -- sha256 of first line at last sync
+  last_synced_at TEXT,
+  PRIMARY KEY (tool, transcript_path)
+);
+
 "#;
 
 const HIT_COLUMNS: &str = "c.id AS chunk_id, c.document_id AS document_id, c.heading_path AS heading_path, c.content AS content, d.rel_path AS rel_path, d.kind AS kind, d.origin AS origin, d.title AS title, d.okf_type AS okf_type, d.tags AS tags, d.status AS status, d.stale_after AS stale_after, d.verified AS verified, d.hash AS hash, d.mtime AS mtime";
@@ -349,85 +387,94 @@ impl SqliteStore {
 
     /// Filter fragment referencing bare document columns (no alias).
     fn filter_clause(filters: Option<&SearchFilters>, params: &mut Vec<SqlValue>) -> String {
-        let Some(f) = filters else { return String::new() };
         let mut conds: Vec<String> = Vec::new();
         let push = |params: &mut Vec<SqlValue>, v: SqlValue| -> String {
             params.push(v);
             "?".to_string()
         };
-        if let Some(kinds) = &f.kinds {
-            if !kinds.is_empty() {
-                let placeholders: Vec<String> = kinds
-                    .iter()
-                    .map(|k| push(params, SqlValue::Text(k.clone())))
-                    .collect();
-                conds.push(format!("kind IN ({})", placeholders.join(",")));
-            }
-        }
-        if let Some(origins) = &f.origins {
-            if !origins.is_empty() {
-                let placeholders: Vec<String> = origins
-                    .iter()
-                    .map(|o| push(params, SqlValue::Text(o.clone())))
-                    .collect();
-                conds.push(format!("origin IN ({})", placeholders.join(",")));
-            }
-        }
-        if let Some(types) = &f.okf_types {
-            if !types.is_empty() {
-                let placeholders: Vec<String> = types
-                    .iter()
-                    .map(|t| push(params, SqlValue::Text(t.clone())))
-                    .collect();
-                conds.push(format!("okf_type IN ({})", placeholders.join(",")));
-            }
-        }
-        for tag in f.tags.clone().unwrap_or_default() {
-            let p = push(params, SqlValue::Text(format!("%\"{tag}\"%")));
-            conds.push(format!("tags LIKE {p}"));
-        }
-        if let Some(statuses) = &f.statuses {
-            if !statuses.is_empty() {
-                let placeholders: Vec<String> = statuses
-                    .iter()
-                    .map(|st| push(params, SqlValue::Text(st.clone())))
-                    .collect();
-                conds.push(format!("status IN ({})", placeholders.join(",")));
-            }
-        }
-        if let Some(trust) = &f.trust_min {
-            if let Some((_, min)) = TRUST_ORDER.iter().find(|(k, _)| k == trust) {
-                if *min >= 1 {
-                    conds.push("verified IS NOT NULL AND verified != '[]'".into());
-                }
-                if *min >= 2 {
-                    conds.push("verified LIKE '%\"human:%'".into());
+        if let Some(f) = filters {
+            if let Some(kinds) = &f.kinds {
+                if !kinds.is_empty() {
+                    let placeholders: Vec<String> = kinds
+                        .iter()
+                        .map(|k| push(params, SqlValue::Text(k.clone())))
+                        .collect();
+                    conds.push(format!("kind IN ({})", placeholders.join(",")));
                 }
             }
-        }
-        if f.fresh_only.unwrap_or(false) {
-            let p = push(params, SqlValue::Text(chrono::Utc::now().to_rfc3339()));
-            conds.push(format!("(stale_after IS NULL OR stale_after > {p})"));
-        }
-        let prefixes: Vec<String> = f
-            .path_prefixes
-            .clone()
-            .unwrap_or_else(|| vec!["*".into()])
-            .into_iter()
-            .filter(|p| p != "*")
-            .collect();
-        if !prefixes.is_empty() {
-            let parts: Vec<String> = prefixes
-                .iter()
-                .flat_map(|p| {
-                    vec![
-                        push(params, SqlValue::Text(p.clone())),
-                        push(params, SqlValue::Text(format!("{p}/%"))),
-                        push(params, SqlValue::Text(format!("{p}/%/%"))),
-                    ]
-                })
+            if let Some(origins) = &f.origins {
+                if !origins.is_empty() {
+                    let placeholders: Vec<String> = origins
+                        .iter()
+                        .map(|o| push(params, SqlValue::Text(o.clone())))
+                        .collect();
+                    conds.push(format!("origin IN ({})", placeholders.join(",")));
+                }
+            }
+            if let Some(types) = &f.okf_types {
+                if !types.is_empty() {
+                    let placeholders: Vec<String> = types
+                        .iter()
+                        .map(|t| push(params, SqlValue::Text(t.clone())))
+                        .collect();
+                    conds.push(format!("okf_type IN ({})", placeholders.join(",")));
+                }
+            }
+            for tag in f.tags.clone().unwrap_or_default() {
+                let p = push(params, SqlValue::Text(format!("%\"{tag}\"%")));
+                conds.push(format!("tags LIKE {p}"));
+            }
+            if let Some(statuses) = &f.statuses {
+                if !statuses.is_empty() {
+                    let placeholders: Vec<String> = statuses
+                        .iter()
+                        .map(|st| push(params, SqlValue::Text(st.clone())))
+                        .collect();
+                    conds.push(format!("status IN ({})", placeholders.join(",")));
+                }
+            }
+            if let Some(trust) = &f.trust_min {
+                if let Some((_, min)) = TRUST_ORDER.iter().find(|(k, _)| k == trust) {
+                    if *min >= 1 {
+                        conds.push("verified IS NOT NULL AND verified != '[]'".into());
+                    }
+                    if *min >= 2 {
+                        conds.push("verified LIKE '%\"human:%'".into());
+                    }
+                }
+            }
+            if f.fresh_only.unwrap_or(false) {
+                let p = push(params, SqlValue::Text(chrono::Utc::now().to_rfc3339()));
+                conds.push(format!("(stale_after IS NULL OR stale_after > {p})"));
+            }
+            let prefixes: Vec<String> = f
+                .path_prefixes
+                .clone()
+                .unwrap_or_else(|| vec!["*".into()])
+                .into_iter()
+                .filter(|p| p != "*")
                 .collect();
-            conds.push(format!("({})", parts.join(" OR ")));
+            if !prefixes.is_empty() {
+                let parts: Vec<String> = prefixes
+                    .iter()
+                    .flat_map(|p| {
+                        vec![
+                            push(params, SqlValue::Text(p.clone())),
+                            push(params, SqlValue::Text(format!("{p}/%"))),
+                            push(params, SqlValue::Text(format!("{p}/%/%"))),
+                        ]
+                    })
+                    .collect();
+                conds.push(format!("({})", parts.join(" OR ")));
+            }
+        }
+        // Draft exclusion: promoter-generated drafts stay out of results
+        // unless the caller explicitly filters for that status.
+        let statuses_given = filters
+            .and_then(|f| f.statuses.as_ref())
+            .map_or(false, |s| !s.is_empty());
+        if !statuses_given {
+            conds.push("(status IS NULL OR status != 'draft')".into());
         }
         if conds.is_empty() {
             String::new()
@@ -447,6 +494,17 @@ impl Store for SqliteStore {
         let conn = self.writer_conn();
         conn.execute_batch(SCHEMA)
             .map_err(|e| Error::Store(e.to_string()))?;
+        // Best-effort column additions for pre-existing databases;
+        // duplicate-column errors on fresh schemas are ignored.
+        for col in [
+            "source_session_id TEXT",
+            "source_ref TEXT",
+            "promote_candidate INTEGER NOT NULL DEFAULT 0",
+            "promoted_at TEXT",
+        ] {
+            let sql = format!("ALTER TABLE memories ADD COLUMN {col}");
+            let _ = conn.execute(&sql, []);
+        }
         conn.execute(
             "INSERT OR IGNORE INTO migrations (id, applied_at) VALUES (2, ?)",
             [chrono::Utc::now().to_rfc3339()],
@@ -1371,22 +1429,43 @@ impl Store for SqliteStore {
         Ok((count, max_mtime))
     }
 
-    async fn insert_memory(&self, scope_key: &str, memory_type: &str, content: &str, content_hash: &str) -> Result<()> {
+    async fn insert_memory(
+        &self,
+        scope_key: &str,
+        memory_type: &str,
+        content: &str,
+        content_hash: &str,
+        source_session_id: Option<&str>,
+        source_ref: Option<&str>,
+        promote_candidate: Option<bool>,
+    ) -> Result<String> {
         let conn = self.writer_conn();
         let now = chrono::Utc::now().to_rfc3339();
+        let id = ulid::Ulid::new().to_string();
         conn.execute(
-            "INSERT INTO memories (id, scope_key, memory_type, content, content_hash, created_at, accessed_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            rusqlite::params![ulid::Ulid::new().to_string(), scope_key, memory_type, content, content_hash, now, now],
+            "INSERT INTO memories (id, scope_key, memory_type, content, content_hash, created_at, accessed_at, source_session_id, source_ref, promote_candidate) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            rusqlite::params![
+                id.clone(),
+                scope_key,
+                memory_type,
+                content,
+                content_hash,
+                now,
+                now,
+                source_session_id,
+                source_ref,
+                promote_candidate.unwrap_or(false) as i64,
+            ],
         ).map_err(|e| Error::Store(e.to_string()))?;
-        Ok(())
+        Ok(id)
     }
 
     async fn search_memories(&self, scope_key: &str, query: &str, limit: i64) -> Result<Vec<crate::services::memory::AgentMemory>> {
         let conn = self.writer_conn();
         let mut stmt = conn.prepare(
-            "SELECT * FROM memories WHERE scope_key = ?1 AND content LIKE ?2 ORDER BY access_count DESC LIMIT ?3"
+            "SELECT * FROM memories WHERE scope_key = ?1 AND content LIKE ?2 ESCAPE '\\' ORDER BY access_count DESC, created_at DESC LIMIT ?3"
         ).map_err(|e| Error::Store(e.to_string()))?;
-        let pattern = format!("%{query}%");
+        let pattern = format!("%{}%", crate::store::like_escape(query));
         let rows = stmt.query_map(rusqlite::params![scope_key, pattern, limit], |row| {
             Ok(crate::services::memory::AgentMemory {
                 id: row.get("id")?,
@@ -1394,15 +1473,40 @@ impl Store for SqliteStore {
                 memory_type: match row.get::<_, String>("memory_type")?.as_str() {
                     "episodic" => crate::services::memory::MemoryType::Episodic,
                     "procedural" => crate::services::memory::MemoryType::Procedural,
+                    "preference" => crate::services::memory::MemoryType::Preference,
                     _ => crate::services::memory::MemoryType::Semantic,
                 },
                 content: row.get("content")?,
                 created_at: row.get("created_at")?,
                 accessed_at: row.get("accessed_at")?,
                 access_count: row.get("access_count")?,
+                source_session_id: row.get("source_session_id")?,
+                source_ref: row.get("source_ref")?,
             })
         }).map_err(|e| Error::Store(e.to_string()))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| Error::Store(e.to_string()))
+        let mut results = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| Error::Store(e.to_string()))?;
+        // Side-effect: record an access for every returned memory.
+        if !results.is_empty() {
+            let ids: Vec<String> = results.iter().map(|m| m.id.clone()).collect();
+            // Ids bind to ?1..?k; accessed_at binds to the trailing ?k+1.
+            let placeholders = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "UPDATE memories SET access_count = access_count + 1, accessed_at = ?{n} WHERE id IN ({placeholders})",
+                n = ids.len() + 1
+            );
+            let now = chrono::Utc::now().to_rfc3339();
+            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 1);
+            for id in &ids {
+                params.push(id);
+            }
+            params.push(&now);
+            conn.execute(&sql, params.as_slice()).map_err(|e| Error::Store(e.to_string()))?;
+            // Returned rows must reflect post-bump state.
+            for m in &mut results {
+                m.access_count += 1;
+            }
+        }
+        Ok(results)
     }
 
     async fn update_memory(&self, id: &str, new_content: &str, new_hash: &str) -> Result<()> {
@@ -1418,6 +1522,187 @@ impl Store for SqliteStore {
         let conn = self.writer_conn();
         let n = conn.execute("DELETE FROM memories WHERE id = ?1", [id]).map_err(|e| Error::Store(e.to_string()))?;
         Ok(n > 0)
+    }
+
+    async fn list_promotable_memories(&self, limit: i64) -> Result<Vec<crate::services::memory::AgentMemory>> {
+        let conn = self.writer_conn();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM memories WHERE promote_candidate = 1 AND promoted_at IS NULL ORDER BY created_at ASC LIMIT ?1"
+        ).map_err(|e| Error::Store(e.to_string()))?;
+        let rows = stmt.query_map(rusqlite::params![limit], |row| {
+            Ok(crate::services::memory::AgentMemory {
+                id: row.get("id")?,
+                scope_key: row.get("scope_key")?,
+                memory_type: match row.get::<_, String>("memory_type")?.as_str() {
+                    "episodic" => crate::services::memory::MemoryType::Episodic,
+                    "procedural" => crate::services::memory::MemoryType::Procedural,
+                    "preference" => crate::services::memory::MemoryType::Preference,
+                    _ => crate::services::memory::MemoryType::Semantic,
+                },
+                content: row.get("content")?,
+                created_at: row.get("created_at")?,
+                accessed_at: row.get("accessed_at")?,
+                access_count: row.get("access_count")?,
+                source_session_id: row.get("source_session_id")?,
+                source_ref: row.get("source_ref")?,
+            })
+        }).map_err(|e| Error::Store(e.to_string()))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| Error::Store(e.to_string()))
+    }
+
+    async fn mark_memory_promoted(&self, id: &str, promoted_at: &str) -> Result<()> {
+        let conn = self.writer_conn();
+        conn.execute(
+            "UPDATE memories SET promoted_at = ?1 WHERE id = ?2",
+            rusqlite::params![promoted_at, id],
+        ).map_err(|e| Error::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn record_memory_mutation(&self, m: &MemoryMutation) -> Result<()> {
+        let conn = self.writer_conn();
+        conn.execute(
+            "INSERT INTO memory_mutations (id, memory_id, action, old_content, new_content, timestamp) VALUES (?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![m.id, m.memory_id, m.action, m.old_content, m.new_content, m.timestamp],
+        ).map_err(|e| Error::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_memory_mutations(&self, memory_id: &str, limit: i64) -> Result<Vec<MemoryMutation>> {
+        let conn = self.writer_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, memory_id, action, old_content, new_content, timestamp FROM memory_mutations WHERE memory_id = ?1 ORDER BY timestamp DESC, rowid DESC LIMIT ?2"
+        ).map_err(|e| Error::Store(e.to_string()))?;
+        let rows = stmt.query_map(rusqlite::params![memory_id, limit], |row| {
+            Ok(MemoryMutation {
+                id: row.get("id")?,
+                memory_id: row.get("memory_id")?,
+                action: row.get("action")?,
+                old_content: row.get("old_content")?,
+                new_content: row.get("new_content")?,
+                timestamp: row.get("timestamp")?,
+            })
+        }).map_err(|e| Error::Store(e.to_string()))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| Error::Store(e.to_string()))
+    }
+
+    async fn insert_revision(&self, rel_path: &str, hash: &str, body: &str, source: &str, operation: &str) -> Result<i64> {
+        let conn = self.writer_conn();
+        let seq: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM document_revisions WHERE rel_path = ?1",
+            [rel_path],
+            |row| row.get(0),
+        ).map_err(|e| Error::Store(e.to_string()))?;
+        let id = format!("rev-{}", &ulid::Ulid::new().to_string()[..12]);
+        conn.execute(
+            "INSERT INTO document_revisions (id, rel_path, seq, hash, body, source, operation, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            rusqlite::params![id, rel_path, seq, hash, body, Some(source), operation, chrono::Utc::now().to_rfc3339()],
+        ).map_err(|e| Error::Store(e.to_string()))?;
+        Ok(seq)
+    }
+
+    async fn list_revisions(&self, rel_path: &str, limit: i64) -> Result<Vec<DocumentRevision>> {
+        let conn = self.writer_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, rel_path, seq, hash, source, operation, created_at FROM document_revisions WHERE rel_path = ?1 ORDER BY seq DESC LIMIT ?2"
+        ).map_err(|e| Error::Store(e.to_string()))?;
+        let rows = stmt.query_map(rusqlite::params![rel_path, limit], |row| {
+            Ok(DocumentRevision {
+                id: row.get("id")?,
+                rel_path: row.get("rel_path")?,
+                seq: row.get("seq")?,
+                hash: row.get("hash")?,
+                // Metadata only; the body is loaded via get_revision.
+                body: String::new(),
+                source: row.get("source")?,
+                operation: row.get("operation")?,
+                created_at: row.get("created_at")?,
+            })
+        }).map_err(|e| Error::Store(e.to_string()))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| Error::Store(e.to_string()))
+    }
+
+    async fn get_revision(&self, rel_path: &str, seq: i64) -> Result<Option<DocumentRevision>> {
+        let conn = self.writer_conn();
+        let res = conn.query_row(
+            "SELECT id, rel_path, seq, hash, body, source, operation, created_at FROM document_revisions WHERE rel_path = ?1 AND seq = ?2",
+            rusqlite::params![rel_path, seq],
+            |row| Ok(DocumentRevision {
+                id: row.get("id")?,
+                rel_path: row.get("rel_path")?,
+                seq: row.get("seq")?,
+                hash: row.get("hash")?,
+                body: row.get("body")?,
+                source: row.get("source")?,
+                operation: row.get("operation")?,
+                created_at: row.get("created_at")?,
+            }),
+        )
+        .map_err(|e| Error::Store(e.to_string()))
+        .ok();
+        Ok(res)
+    }
+
+    async fn get_revision_by_hash(&self, rel_path: &str, hash: &str) -> Result<Option<DocumentRevision>> {
+        let conn = self.writer_conn();
+        let res = conn.query_row(
+            "SELECT id, rel_path, seq, hash, body, source, operation, created_at FROM document_revisions WHERE rel_path = ?1 AND hash = ?2 ORDER BY seq DESC LIMIT 1",
+            rusqlite::params![rel_path, hash],
+            |row| Ok(DocumentRevision {
+                id: row.get("id")?,
+                rel_path: row.get("rel_path")?,
+                seq: row.get("seq")?,
+                hash: row.get("hash")?,
+                body: row.get("body")?,
+                source: row.get("source")?,
+                operation: row.get("operation")?,
+                created_at: row.get("created_at")?,
+            }),
+        )
+        .ok();
+        Ok(res)
+    }
+
+    async fn get_watermark(&self, tool: &str, path: &str) -> Result<Option<TranscriptWatermark>> {
+        let conn = self.writer_conn();
+        let res = conn.query_row(
+            "SELECT tool, transcript_path, last_line, prefix_hash, last_synced_at FROM transcript_watermarks WHERE tool = ?1 AND transcript_path = ?2",
+            [tool, path],
+            |row| Ok(TranscriptWatermark {
+                tool: row.get("tool")?,
+                transcript_path: row.get("transcript_path")?,
+                last_line: row.get("last_line")?,
+                prefix_hash: row.get("prefix_hash")?,
+                last_synced_at: row.get("last_synced_at")?,
+            }),
+        )
+        .ok();
+        Ok(res)
+    }
+
+    async fn upsert_watermark(&self, w: &TranscriptWatermark) -> Result<()> {
+        let conn = self.writer_conn();
+        conn.execute(
+            "INSERT INTO transcript_watermarks (tool, transcript_path, last_line, prefix_hash, last_synced_at) VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(tool, transcript_path) DO UPDATE SET last_line=excluded.last_line, prefix_hash=excluded.prefix_hash, last_synced_at=excluded.last_synced_at",
+            rusqlite::params![w.tool, w.transcript_path, w.last_line, w.prefix_hash, w.last_synced_at],
+        ).map_err(|e| Error::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn zero_hit_queries(&self, limit: i64) -> Result<Vec<ZeroHitQuery>> {
+        let conn = self.writer_conn();
+        let mut stmt = conn.prepare(
+            "SELECT query, COUNT(*) AS hits, MAX(created_at) AS last_seen FROM queries WHERE zero_hit = 1 GROUP BY query ORDER BY last_seen DESC LIMIT ?1"
+        ).map_err(|e| Error::Store(e.to_string()))?;
+        let rows = stmt.query_map([limit], |row| {
+            Ok(ZeroHitQuery {
+                query: row.get("query")?,
+                hits: row.get("hits")?,
+                last_seen: row.get("last_seen")?,
+            })
+        }).map_err(|e| Error::Store(e.to_string()))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| Error::Store(e.to_string()))
     }
 
     async fn upsert_entity(&self, id: &str, name: &str, entity_type: &str, source_doc: &str) -> Result<()> {
@@ -1528,5 +1813,139 @@ impl Store for SqliteStore {
         )
         .map_err(|e| Error::Store(e.to_string()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn make_store() -> SqliteStore {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let store = SqliteStore::open(path.to_str().unwrap()).unwrap();
+        store.migrate().await.unwrap();
+        std::mem::forget(dir);
+        store
+    }
+
+    #[tokio::test]
+    async fn document_revisions_roundtrip_and_monotonic_seq() {
+        let store = make_store().await;
+        let s1 = store.insert_revision("wiki/a.md", "hash1", "body one", "human:test", "create").await.unwrap();
+        let s2 = store.insert_revision("wiki/a.md", "hash2", "body two", "agent-x/wikillm-api", "update").await.unwrap();
+        assert_eq!((s1, s2), (1, 2));
+        // seq is monotonic per rel_path, not globally
+        assert_eq!(store.insert_revision("wiki/b.md", "h", "x", "s", "create").await.unwrap(), 1);
+
+        let listed = store.list_revisions("wiki/a.md", 10).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].seq, 2, "newest first");
+        assert_eq!(listed[0].operation, "update");
+        assert!(listed.iter().all(|r| r.body.is_empty()), "list is metadata-only");
+
+        let full = store.get_revision("wiki/a.md", 1).await.unwrap().unwrap();
+        assert_eq!(full.body, "body one");
+        let by_hash = store.get_revision_by_hash("wiki/a.md", "hash2").await.unwrap().unwrap();
+        assert_eq!(by_hash.seq, 2);
+        assert!(store.get_revision("wiki/a.md", 99).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn watermark_upsert_and_get() {
+        let store = make_store().await;
+        assert!(store.get_watermark("claude", "/tmp/t.jsonl").await.unwrap().is_none());
+        store.upsert_watermark(&TranscriptWatermark {
+            tool: "claude".into(),
+            transcript_path: "/tmp/t.jsonl".into(),
+            last_line: 10,
+            prefix_hash: Some("abc".into()),
+            last_synced_at: Some("2026-01-01T00:00:00Z".into()),
+        }).await.unwrap();
+        let wm = store.get_watermark("claude", "/tmp/t.jsonl").await.unwrap().unwrap();
+        assert_eq!(wm.last_line, 10);
+        assert_eq!(wm.prefix_hash.as_deref(), Some("abc"));
+        // Upsert updates in place (same PK).
+        store.upsert_watermark(&TranscriptWatermark {
+            tool: "claude".into(),
+            transcript_path: "/tmp/t.jsonl".into(),
+            last_line: 25,
+            prefix_hash: Some("abc".into()),
+            last_synced_at: Some("2026-01-02T00:00:00Z".into()),
+        }).await.unwrap();
+        assert_eq!(store.get_watermark("claude", "/tmp/t.jsonl").await.unwrap().unwrap().last_line, 25);
+    }
+
+    #[tokio::test]
+    async fn memory_mutations_record_and_list_newest_first() {
+        let store = make_store().await;
+        store.record_memory_mutation(&MemoryMutation {
+            id: "m1".into(), memory_id: "mem1".into(), action: "add".into(),
+            old_content: None, new_content: Some("v1".into()),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+        }).await.unwrap();
+        store.record_memory_mutation(&MemoryMutation {
+            id: "m2".into(), memory_id: "mem1".into(), action: "update".into(),
+            old_content: Some("v1".into()), new_content: Some("v2".into()),
+            timestamp: "2026-01-02T00:00:00Z".into(),
+        }).await.unwrap();
+        let history = store.list_memory_mutations("mem1", 10).await.unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].action, "update");
+        assert!(store.list_memory_mutations("other-mem", 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_memories_escapes_wildcards_bumps_and_orders() {
+        let store = make_store().await;
+        store.insert_memory("u|a|", "semantic", "100% done_thing", "h1", None, None, None).await.unwrap();
+        store.insert_memory("u|a|", "semantic", "plain note", "h2", Some("sess-1"), Some("/w/a.md"), Some(true)).await.unwrap();
+
+        // Literal `%`/`_` in the query must not act as LIKE wildcards.
+        let hits = store.search_memories("u|a|", "100% done_", 10).await.unwrap();
+        assert_eq!(hits.len(), 1, "escaped wildcards match literally");
+        assert_eq!(hits[0].content, "100% done_thing");
+        // Returned rows reflect post-bump state (bump happens in the same call).
+        assert_eq!(hits[0].access_count, 1, "row reflects its own access bump");
+
+        // Access bump side-effect + pass-through columns.
+        let bumped = store.search_memories("u|a|", "done", 10).await.unwrap();
+        assert_eq!(bumped.len(), 1);
+        let again = store.search_memories("u|a|", "done", 10).await.unwrap();
+        assert_eq!(again[0].access_count, 3, "two prior searches + this one");
+
+        // Pass-through provenance columns ride on the second row.
+        let plain = store.search_memories("u|a|", "plain", 10).await.unwrap();
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].source_session_id.as_deref(), Some("sess-1"));
+        assert_eq!(plain[0].source_ref.as_deref(), Some("/w/a.md"));
+
+        // Backslash itself is escaped too.
+        let none = store.search_memories("u|a|", "100\\%", 10).await.unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn zero_hit_queries_aggregate_counts() {
+        let store = make_store().await;
+        for q in ["ghost query", "ghost query", "another ghost"] {
+            store.record_query(&QueryRecord {
+                id: ulid::Ulid::new().to_string(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                query: q.into(),
+                mode: "hybrid".into(),
+                project: None,
+                latency_ms: 1.0,
+                result_count: 0,
+                zero_hit: true,
+                top_paths: vec![],
+                source: None,
+                error: None,
+            }).await.unwrap();
+        }
+        let gaps = store.zero_hit_queries(10).await.unwrap();
+        assert_eq!(gaps.len(), 2);
+        let ghost = gaps.iter().find(|g| g.query == "ghost query").unwrap();
+        assert_eq!(ghost.hits, 2);
     }
 }

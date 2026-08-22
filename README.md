@@ -29,9 +29,11 @@ This repository contains two functionally equivalent implementations:
 | Tests | vitest (138 tests) | cargo test (76 tests) |
 
 Both serve the same REST API, read/write the same wiki folder format, and can
-be used interchangeably. The TypeScript version is the original and has more
-battle-tested edge cases; the Rust version offers lower memory footprint and
-single-binary deployment.
+be used interchangeably for the original surface. Note the split: the
+**memory/session, version-history, community, and corpus-gap subsystems are
+Rust-first** — they exist only in the Rust tree. The TypeScript tree continues
+to serve the pre-existing API surface (pages, search, query, connectors,
+bundles, webhooks) and has not gained these features.
 
 ### Running the Rust version
 
@@ -62,6 +64,14 @@ See [`rust/README.md`](rust/README.md) for full details.
 - **Projects & RBAC** — named project scopes with per-key `read`/`write`/`admin` roles.
 - **MCP server** — LLM-free retrieval tools for agents over stdio or Streamable HTTP.
 - **Analytics** — Prometheus `/metrics`, query analytics, and a feedback loop.
+- **Agent memory ledger + sessions API** — per-identity agent memories (`POST /v1/memory`) with dedupe/update semantics, an append-only mutation ledger per memory, and sessions (`/v1/sessions`) that inject scoped memories at start and extract durable facts from every message (LLM extraction when configured, heuristic classifier otherwise).
+- **Version history & diffs** — every page write (API or external edit) records an append-only revision; `GET /v1/pages/:rel_path/versions` lists them, `/versions/:seq` fetches raw bodies, and `/diff?from=&to=` returns a unified diff across seq, hash, or `current`.
+- **Communities** — label-propagation community detection over the union of wikilink edges and typed KG relations (`GET /v1/communities`, `GET /v1/communities/:id/docs`), with KG entity/relation extraction wired into the indexing pipeline.
+- **Corpus-gap report** — zero-hit queries are recorded and aggregated for admins (`GET /v1/admin/gaps`) to expose what the corpus fails to answer.
+- **Retrieval guard / abstention** — a CRAG-style grading pass on `/v1/query` (on by default): incorrect retrievals trigger one query rewrite round and then a clean "Not answerable from this knowledge base." abstention instead of hallucinated answers.
+- **Coding-agent transcript sync** — optionally ingests Claude Code / Codex `*.jsonl` transcripts on an interval with watermark-based incremental resume, prefix-hash rewrite detection, and the same fact-extraction path as sessions.
+- **Promotion pipeline** — clusters `promote_candidate` memories (embedding similarity when an embedder is configured, Jaccard fallback otherwise) and synthesizes draft wiki pages with full provenance frontmatter via `POST /v1/admin/promote`.
+- **Eval harness** — `scripts/memory_eval.py` measures fact recall, preference following, procedural recall, latest-state handling, and abstention against a live instance.
 - **Fully runtime-configurable** — settings, LLM endpoint, and rate limits hot-apply via `GET/PUT /v1/settings/:key` (no restart); fresh instances bootstrap an admin key automatically.
 
 ## Quick start
@@ -186,6 +196,20 @@ All routes are under `/v1` unless noted.
 | GET/PUT/DELETE | `/v1/settings/:key` | Read/update/delete a runtime setting (admin); hot-applied at runtime |
 | GET/POST | `/v1/keys` | List / create API keys (admin); plaintext returned once, stored hashed |
 | DELETE | `/v1/keys/:name` | Delete an API key (admin) |
+| POST | `/v1/memory` | Store a memory (dedupe/update; returns action + mutation) |
+| GET | `/v1/memory` | Search/list the caller's memories (`q`, `type`, `agent`, `session_id`, `limit`) |
+| GET | `/v1/memory/:id/history` | Append-only mutation ledger for one memory |
+| DELETE | `/v1/memory/:id` | Delete a memory (delete recorded in the ledger) |
+| POST | `/v1/sessions` | Start a session; returns injected memory count |
+| POST | `/v1/sessions/:id/messages` | Ingest one message; returns extracted facts stored as memories |
+| GET | `/v1/sessions/:id` | Session metadata + in-scope memories |
+| GET | `/v1/pages/:rel_path/versions` | Revision history of a page (metadata only) |
+| GET | `/v1/pages/:rel_path/versions/:seq` | Raw markdown body of one revision |
+| GET | `/v1/pages/:rel_path/diff` | Unified diff: `from=`/`to=` accept seq, hash, or `current` |
+| GET | `/v1/communities` | Detected communities with member counts |
+| GET | `/v1/communities/:id/docs` | Member documents of one community |
+| GET | `/v1/admin/gaps` | Zero-hit query aggregation (corpus gaps) (admin) |
+| POST | `/v1/admin/promote` | Run one promotion pass → draft wiki pages (admin) |
 
 ### Runtime configuration (no restart)
 
@@ -202,6 +226,26 @@ Hot-appliable keys include: `public_read`, `rate_limit_rpm`, `connector_poll_sec
 `llm_embed_model`, `embedding_dims`, `llm_distill`, `okf_strict`, `human_actors`, `layout`,
 `embedding_provider` (`none`/`api`/`onnx`/`auto`), `onnx_model`, `onnx_dtype`
 (`q8`/`fp16`/`fp32`), `onnx_device`, `max_upload_mb`, and `webhook_secret` (secret — masked).
+
+Memory-loop settings (Rust tree) with their defaults:
+
+| Key | Type | Default | Description |
+| --- | ---- | ------- | ----------- |
+| `retrieval_guard` | bool | `true` | CRAG-style retrieval grading on `/v1/query` (rewrite round, then abstention) |
+| `promotion_enabled` | bool | `false` | Master gate for the promotion pipeline (`POST /v1/admin/promote`) |
+| `promotion_max_pages` | int | `3` | Max draft pages per promotion run (also caps explicit limits) |
+| `improver_interval_seconds` | int | `3600` | Improver maintenance tick interval; `0` disables the loop |
+| `improver_max_llm_calls` | int | `4` | Per-tick LLM budget for staleness refresh + memory hygiene |
+| `improver_autorewrite` | bool | `false` | Allow append-only refresh proposals to `log.md` for stale pages |
+| `transcript_sync_enabled` | bool | `false` | Gate for the coding-agent transcript sync loop (hot-applies within one interval) |
+| `transcript_interval_seconds` | int | `60` | Transcript sync interval (min 5) |
+| `transcript_roots` | string | `~/.claude/projects,~/.codex/sessions` | Comma-separated transcript roots to scan (`~` expanded) |
+| `hook_editor` | string | — | Informational: editor hook config pointing at the sessions API |
+
+Improver and transcript loop intervals are read at boot; the transcript
+enable/disable gate is re-checked every tick so it hot-applies without a
+restart. Editor hooks are documented manual setup: point them at
+`POST /v1/sessions/:id/messages` (see the sessions API above).
 
 **Secrets are masked** in `GET /v1/settings` responses.
 

@@ -39,6 +39,7 @@ futures = "0.3"
 rand = "0.8"
 percent-encoding = "2"
 libc = "0.2"
+tracing = "0.1"
 
 [features]
 default = []

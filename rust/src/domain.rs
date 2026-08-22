@@ -348,3 +348,9 @@ pub fn trust_tier(verified: Option<&Vec<VerifiedEntry>>) -> &'static str {
         }
     }
 }
+
+// -- Versioning / memory-ledger rows -----------------------------------------
+// Defined in `crate::store` per the wave-1 ownership split (they sit next to
+// the DDL they map to); re-exported here so HTTP handlers and external
+// consumers find them under the shared domain namespace.
+pub use crate::store::{DocumentRevision, MemoryMutation, TranscriptWatermark, ZeroHitQuery};

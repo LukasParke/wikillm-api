@@ -35,6 +35,16 @@ pub const SETTINGS: &[SettingMeta] = &[
     SettingMeta { key: "max_upload_mb", kind: "int", mutable: true, requires_reindex: false },
     SettingMeta { key: "webhook_secret", kind: "secret", mutable: true, requires_reindex: false },
     SettingMeta { key: "layout", kind: "enum", mutable: true, requires_reindex: false },
+    SettingMeta { key: "retrieval_guard", kind: "bool", mutable: true, requires_reindex: false },
+    SettingMeta { key: "promotion_enabled", kind: "bool", mutable: true, requires_reindex: false },
+    SettingMeta { key: "promotion_max_pages", kind: "int", mutable: true, requires_reindex: false },
+    SettingMeta { key: "improver_interval_seconds", kind: "int", mutable: true, requires_reindex: false },
+    SettingMeta { key: "improver_max_llm_calls", kind: "int", mutable: true, requires_reindex: false },
+    SettingMeta { key: "improver_autorewrite", kind: "bool", mutable: true, requires_reindex: false },
+    SettingMeta { key: "transcript_sync_enabled", kind: "bool", mutable: true, requires_reindex: false },
+    SettingMeta { key: "transcript_interval_seconds", kind: "int", mutable: true, requires_reindex: false },
+    SettingMeta { key: "transcript_roots", kind: "string", mutable: true, requires_reindex: false },
+    SettingMeta { key: "hook_editor", kind: "string", mutable: true, requires_reindex: false },
 ];
 
 const IMMUTABLE: &[&str] = &["wiki_root", "port", "host", "db_backend", "database_url"];
@@ -81,6 +91,18 @@ impl SettingsService {
                 std::env::var("ONNX_MODEL")
                     .unwrap_or_else(|_| "Xenova/bge-small-en-v1.5".into()),
             )),
+            "retrieval_guard" => Some(Value::Bool(true)),
+            "promotion_enabled" => Some(Value::Bool(false)),
+            "promotion_max_pages" => Some(Value::from(3i64)),
+            "improver_interval_seconds" => Some(Value::from(3600i64)),
+            "improver_max_llm_calls" => Some(Value::from(4i64)),
+            "improver_autorewrite" => Some(Value::Bool(false)),
+            "transcript_sync_enabled" => Some(Value::Bool(false)),
+            "transcript_interval_seconds" => Some(Value::from(60i64)),
+            "transcript_roots" => {
+                Some(Value::String("~/.claude/projects,~/.codex/sessions".into()))
+            }
+            "hook_editor" => Some(Value::String(String::new())),
             "onnx_dtype" => Some(Value::String(std::env::var("ONNX_DTYPE").unwrap_or_else(|_| "q8".into()))),
             "onnx_device" => Some(Value::String(std::env::var("ONNX_DEVICE").unwrap_or_else(|_| "cpu".into()))),
             "llm_distill" => Some(Value::Bool(self.config.llm_distill)),
@@ -229,6 +251,14 @@ fn validate_setting(key: &str, value: &Value) -> Result<()> {
         ("connector_poll_seconds", Value::Number(n)) => (5..=86_400).contains(&n.as_i64().unwrap_or(-1)),
         ("max_upload_mb", Value::Number(n)) => (1..=4096).contains(&n.as_i64().unwrap_or(-1)),
         ("embedding_dims", Value::Number(n)) => (64..=4096).contains(&n.as_i64().unwrap_or(-1)),
+        ("retrieval_guard", Value::Bool(_))
+        | ("promotion_enabled", Value::Bool(_))
+        | ("improver_autorewrite", Value::Bool(_))
+        | ("transcript_sync_enabled", Value::Bool(_)) => true,
+        ("promotion_max_pages", Value::Number(n)) => (0..=10_000).contains(&n.as_i64().unwrap_or(-1)),
+        ("improver_interval_seconds", Value::Number(n)) => (0..=86_400).contains(&n.as_i64().unwrap_or(-1)),
+        ("improver_max_llm_calls", Value::Number(n)) => (0..=1_000).contains(&n.as_i64().unwrap_or(-1)),
+        ("transcript_interval_seconds", Value::Number(n)) => (5..=86_400).contains(&n.as_i64().unwrap_or(-1)),
         ("embedding_provider", Value::String(s)) => ["none", "api", "onnx", "auto"].contains(&s.as_str()),
         ("onnx_dtype", Value::String(s)) => ["q8", "fp16", "fp32", "quantized", "auto"].contains(&s.as_str()),
         ("layout", Value::String(s)) => ["auto", "okf", "wikillm"].contains(&s.as_str()),

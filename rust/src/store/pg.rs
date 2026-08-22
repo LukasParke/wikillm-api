@@ -3,12 +3,25 @@
 
 use crate::domain::*;
 use crate::error::{Error, Result};
-use crate::store::{fts_query, Store};
+use crate::store::{fts_query, DocumentRevision, MemoryMutation, Store, TranscriptWatermark, ZeroHitQuery};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_postgres::NoTls;
+
+fn row_to_revision(row: &tokio_postgres::Row) -> DocumentRevision {
+    DocumentRevision {
+        id: row.get("id"),
+        rel_path: row.get("rel_path"),
+        seq: row.get("seq"),
+        hash: row.get("hash"),
+        body: row.get("body"),
+        source: row.get("source"),
+        operation: row.get("operation"),
+        created_at: row.get("created_at"),
+    }
+}
 
 pub struct PostgresStore {
     client: Arc<Mutex<tokio_postgres::Client>>,
@@ -104,72 +117,81 @@ impl PostgresStore {
 }
 
 fn build_filter_clause(filters: Option<&SearchFilters>, params: &mut Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>, base: usize) -> String {
-    let Some(f) = filters else { return String::new() };
     let mut conds: Vec<String> = Vec::new();
     let push = |params: &mut Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>, v: Box<dyn tokio_postgres::types::ToSql + Sync + Send>| -> String {
         params.push(v);
         format!("${}", base + params.len())
     };
-    if let Some(kinds) = &f.kinds {
-        if !kinds.is_empty() {
-            let placeholders: Vec<String> = kinds.iter().map(|k| push(params, Box::new(k.clone()))).collect();
-            conds.push(format!("kind IN ({})", placeholders.join(",")));
-        }
-    }
-    if let Some(origins) = &f.origins {
-        if !origins.is_empty() {
-            let placeholders: Vec<String> = origins.iter().map(|o| push(params, Box::new(o.clone()))).collect();
-            conds.push(format!("origin IN ({})", placeholders.join(",")));
-        }
-    }
-    if let Some(types) = &f.okf_types {
-        if !types.is_empty() {
-            let placeholders: Vec<String> = types.iter().map(|t| push(params, Box::new(t.clone()))).collect();
-            conds.push(format!("okf_type IN ({})", placeholders.join(",")));
-        }
-    }
-    for tag in f.tags.clone().unwrap_or_default() {
-        let p = push(params, Box::new(tag.clone()));
-        conds.push(format!("tags @> '{p}'::jsonb"));
-    }
-    if let Some(statuses) = &f.statuses {
-        if !statuses.is_empty() {
-            let placeholders: Vec<String> = statuses.iter().map(|s| push(params, Box::new(s.clone()))).collect();
-            conds.push(format!("status IN ({})", placeholders.join(",")));
-        }
-    }
-    if let Some(trust) = &f.trust_min {
-        if let Some((_, min)) = TRUST_ORDER.iter().find(|(k, _)| k == trust) {
-            if *min >= 1 {
-                conds.push("verified IS NOT NULL AND jsonb_array_length(verified) > 0".into());
-            }
-            if *min >= 2 {
-                conds.push("EXISTS (SELECT 1 FROM jsonb_array_elements_text(verified) v WHERE v LIKE 'human:%')".into());
+    if let Some(f) = filters {
+        if let Some(kinds) = &f.kinds {
+            if !kinds.is_empty() {
+                let placeholders: Vec<String> = kinds.iter().map(|k| push(params, Box::new(k.clone()))).collect();
+                conds.push(format!("kind IN ({})", placeholders.join(",")));
             }
         }
-    }
-    if f.fresh_only.unwrap_or(false) {
-        let p = push(params, Box::new(chrono::Utc::now().to_rfc3339()));
-        conds.push(format!("(stale_after IS NULL OR stale_after > {p})"));
-    }
-    let prefixes: Vec<String> = f
-        .path_prefixes
-        .clone()
-        .unwrap_or_else(|| vec!["*".into()])
-        .into_iter()
-        .filter(|p| p != "*")
-        .collect();
-    if !prefixes.is_empty() {
-        let parts: Vec<String> = prefixes
-            .iter()
-            .flat_map(|p| {
-                vec![
-                    push(params, Box::new(format!("{p}"))),
-                    push(params, Box::new(format!("{p}/%"))),
-                ]
-            })
+        if let Some(origins) = &f.origins {
+            if !origins.is_empty() {
+                let placeholders: Vec<String> = origins.iter().map(|o| push(params, Box::new(o.clone()))).collect();
+                conds.push(format!("origin IN ({})", placeholders.join(",")));
+            }
+        }
+        if let Some(types) = &f.okf_types {
+            if !types.is_empty() {
+                let placeholders: Vec<String> = types.iter().map(|t| push(params, Box::new(t.clone()))).collect();
+                conds.push(format!("okf_type IN ({})", placeholders.join(",")));
+            }
+        }
+        for tag in f.tags.clone().unwrap_or_default() {
+            let p = push(params, Box::new(tag.clone()));
+            conds.push(format!("tags @> '{p}'::jsonb"));
+        }
+        if let Some(statuses) = &f.statuses {
+            if !statuses.is_empty() {
+                let placeholders: Vec<String> = statuses.iter().map(|s| push(params, Box::new(s.clone()))).collect();
+                conds.push(format!("status IN ({})", placeholders.join(",")));
+            }
+        }
+        if let Some(trust) = &f.trust_min {
+            if let Some((_, min)) = TRUST_ORDER.iter().find(|(k, _)| k == trust) {
+                if *min >= 1 {
+                    conds.push("verified IS NOT NULL AND jsonb_array_length(verified) > 0".into());
+                }
+                if *min >= 2 {
+                    conds.push("EXISTS (SELECT 1 FROM jsonb_array_elements_text(verified) v WHERE v LIKE 'human:%')".into());
+                }
+            }
+        }
+        if f.fresh_only.unwrap_or(false) {
+            let p = push(params, Box::new(chrono::Utc::now().to_rfc3339()));
+            conds.push(format!("(stale_after IS NULL OR stale_after > {p})"));
+        }
+        let prefixes: Vec<String> = f
+            .path_prefixes
+            .clone()
+            .unwrap_or_else(|| vec!["*".into()])
+            .into_iter()
+            .filter(|p| p != "*")
             .collect();
-        conds.push(format!("({})", parts.join(" OR ")));
+        if !prefixes.is_empty() {
+            let parts: Vec<String> = prefixes
+                .iter()
+                .flat_map(|p| {
+                    vec![
+                        push(params, Box::new(format!("{p}"))),
+                        push(params, Box::new(format!("{p}/%"))),
+                    ]
+                })
+                .collect();
+            conds.push(format!("({})", parts.join(" OR ")));
+        }
+    }
+    // Draft exclusion: promoter-generated drafts stay out of results
+    // unless the caller explicitly filters for that status.
+    let statuses_given = filters
+        .and_then(|f| f.statuses.as_ref())
+        .map_or(false, |s| !s.is_empty());
+    if !statuses_given {
+        conds.push("(status IS NULL OR status != 'draft')".into());
     }
     if conds.is_empty() {
         String::new()
@@ -225,6 +247,17 @@ impl Store for PostgresStore {
             "CREATE INDEX IF NOT EXISTS idx_rel_dst ON relation_edges(dst_entity)",
             "CREATE TABLE IF NOT EXISTS wiki_sessions (id TEXT PRIMARY KEY, agent_name TEXT NOT NULL, user_id TEXT NOT NULL, created_at TEXT NOT NULL, context_summary TEXT)",
             "CREATE TABLE IF NOT EXISTS api_keys (name TEXT PRIMARY KEY, key_hash TEXT NOT NULL UNIQUE, key_prefix TEXT NOT NULL, scope JSONB NOT NULL DEFAULT '[\"*\"]', role TEXT NOT NULL DEFAULT 'write', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, created_by TEXT)",
+            "CREATE TABLE IF NOT EXISTS document_revisions (id TEXT PRIMARY KEY, rel_path TEXT NOT NULL, seq BIGINT NOT NULL, hash TEXT NOT NULL, body TEXT NOT NULL, source TEXT, operation TEXT NOT NULL, created_at TEXT NOT NULL)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_rev_path_seq ON document_revisions(rel_path, seq)",
+            "CREATE INDEX IF NOT EXISTS idx_rev_path ON document_revisions(rel_path)",
+            "CREATE TABLE IF NOT EXISTS memory_mutations (id TEXT PRIMARY KEY, memory_id TEXT NOT NULL, action TEXT NOT NULL, old_content TEXT, new_content TEXT, timestamp TEXT NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS idx_mm_memory ON memory_mutations(memory_id)",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_session_id TEXT",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS source_ref TEXT",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS promote_candidate INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS promoted_at TEXT",
+            "CREATE TABLE IF NOT EXISTS transcript_watermarks (tool TEXT NOT NULL, transcript_path TEXT NOT NULL, last_line BIGINT NOT NULL DEFAULT 0, prefix_hash TEXT, last_synced_at TEXT, PRIMARY KEY (tool, transcript_path))",
+            "CREATE INDEX IF NOT EXISTS idx_documents_stale_after ON documents(stale_after) WHERE stale_after IS NOT NULL",
         ];
         for stmt in ddl {
             self.execute(stmt, &[]).await?;
@@ -757,37 +790,79 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    async fn insert_memory(&self, scope_key: &str, memory_type: &str, content: &str, content_hash: &str) -> Result<()> {
+    async fn insert_memory(
+        &self,
+        scope_key: &str,
+        memory_type: &str,
+        content: &str,
+        content_hash: &str,
+        source_session_id: Option<&str>,
+        source_ref: Option<&str>,
+        promote_candidate: Option<bool>,
+    ) -> Result<String> {
         let now = chrono::Utc::now().to_rfc3339();
+        let id = ulid::Ulid::new().to_string();
         self.execute(
-            "INSERT INTO memories (id, scope_key, memory_type, content, content_hash, created_at, accessed_at) VALUES ($1,$2,$3,$4,$5,$6,$7)",
-            &[&ulid::Ulid::new().to_string(), &scope_key.to_string(), &memory_type.to_string(), &content.to_string(), &content_hash.to_string(), &now, &now],
+            "INSERT INTO memories (id, scope_key, memory_type, content, content_hash, created_at, accessed_at, source_session_id, source_ref, promote_candidate) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+            &[
+                &id.clone(),
+                &scope_key.to_string(),
+                &memory_type.to_string(),
+                &content.to_string(),
+                &content_hash.to_string(),
+                &now,
+                &now,
+                &source_session_id.map(|s| s.to_string()),
+                &source_ref.map(|s| s.to_string()),
+                &(promote_candidate.unwrap_or(false) as i64),
+            ],
         ).await?;
-        Ok(())
+        Ok(id)
     }
 
     async fn search_memories(&self, scope_key: &str, query: &str, limit: i64) -> Result<Vec<crate::services::memory::AgentMemory>> {
-        let pattern = format!("%{query}%");
+        let pattern = format!("%{}%", crate::store::like_escape(query));
         let rows = self.query(
-            "SELECT * FROM memories WHERE scope_key = $1 AND content LIKE $2 ORDER BY access_count DESC LIMIT $3",
+            "SELECT * FROM memories WHERE scope_key = $1 AND content LIKE $2 ESCAPE '\\' ORDER BY access_count DESC, created_at DESC LIMIT $3",
             &[&scope_key.to_string(), &pattern, &limit],
         ).await?;
-        Ok(rows.iter().filter_map(|row| {
+        let mut results: Vec<crate::services::memory::AgentMemory> = rows.iter().map(|row| {
             let mt: String = row.get("memory_type");
-            Some(crate::services::memory::AgentMemory {
+            crate::services::memory::AgentMemory {
                 id: row.get("id"),
                 scope_key: row.get("scope_key"),
                 memory_type: match mt.as_str() {
                     "episodic" => crate::services::memory::MemoryType::Episodic,
                     "procedural" => crate::services::memory::MemoryType::Procedural,
+                    "preference" => crate::services::memory::MemoryType::Preference,
                     _ => crate::services::memory::MemoryType::Semantic,
                 },
                 content: row.get("content"),
                 created_at: row.get("created_at"),
                 accessed_at: row.get("accessed_at"),
                 access_count: row.get::<_, Option<i64>>("access_count").unwrap_or(0),
-            })
-        }).collect())
+                source_session_id: row.get("source_session_id"),
+                source_ref: row.get("source_ref"),
+            }
+        }).collect();
+        // Side-effect: record an access for every returned memory.
+        if !results.is_empty() {
+            let ids: Vec<String> = results.iter().map(|m| m.id.clone()).collect();
+            let placeholders = (1..=ids.len()).map(|i| format!("${}", i + 1)).collect::<Vec<_>>().join(",");
+            let sql = format!("UPDATE memories SET access_count = access_count + 1, accessed_at = $1 WHERE id IN ({placeholders})");
+            let now = chrono::Utc::now().to_rfc3339();
+            let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::with_capacity(ids.len() + 1);
+            params.push(&now);
+            for id in &ids {
+                params.push(id);
+            }
+            self.execute(&sql, &params).await?;
+            // Returned rows must reflect post-bump state.
+            for m in &mut results {
+                m.access_count += 1;
+            }
+        }
+        Ok(results)
     }
 
     async fn update_memory(&self, id: &str, new_content: &str, new_hash: &str) -> Result<()> {
@@ -801,6 +876,153 @@ impl Store for PostgresStore {
     async fn delete_memory(&self, id: &str) -> Result<bool> {
         let n = self.execute("DELETE FROM memories WHERE id = $1", &[&id.to_string()]).await?;
         Ok(n > 0)
+    }
+
+    async fn list_promotable_memories(&self, limit: i64) -> Result<Vec<crate::services::memory::AgentMemory>> {
+        let rows = self.query(
+            "SELECT * FROM memories WHERE promote_candidate = 1 AND promoted_at IS NULL ORDER BY created_at ASC LIMIT $1",
+            &[&limit],
+        ).await?;
+        Ok(rows.iter().map(|row| {
+            let mt: String = row.get("memory_type");
+            crate::services::memory::AgentMemory {
+                id: row.get("id"),
+                scope_key: row.get("scope_key"),
+                memory_type: match mt.as_str() {
+                    "episodic" => crate::services::memory::MemoryType::Episodic,
+                    "procedural" => crate::services::memory::MemoryType::Procedural,
+                    "preference" => crate::services::memory::MemoryType::Preference,
+                    _ => crate::services::memory::MemoryType::Semantic,
+                },
+                content: row.get("content"),
+                created_at: row.get("created_at"),
+                accessed_at: row.get("accessed_at"),
+                access_count: row.get::<_, Option<i64>>("access_count").unwrap_or(0),
+                source_session_id: row.get("source_session_id"),
+                source_ref: row.get("source_ref"),
+            }
+        }).collect())
+    }
+
+    async fn mark_memory_promoted(&self, id: &str, promoted_at: &str) -> Result<()> {
+        self.execute(
+            "UPDATE memories SET promoted_at = $1 WHERE id = $2",
+            &[&promoted_at.to_string(), &id.to_string()],
+        ).await?;
+        Ok(())
+    }
+
+    // Memory mutation ledger
+
+    async fn record_memory_mutation(&self, m: &MemoryMutation) -> Result<()> {
+        self.execute(
+            "INSERT INTO memory_mutations (id, memory_id, action, old_content, new_content, timestamp) VALUES ($1,$2,$3,$4,$5,$6)",
+            &[&m.id, &m.memory_id, &m.action, &m.old_content, &m.new_content, &m.timestamp],
+        ).await?;
+        Ok(())
+    }
+
+    async fn list_memory_mutations(&self, memory_id: &str, limit: i64) -> Result<Vec<MemoryMutation>> {
+        let rows = self.query(
+            "SELECT id, memory_id, action, old_content, new_content, timestamp FROM memory_mutations WHERE memory_id = $1 ORDER BY timestamp DESC LIMIT $2",
+            &[&memory_id.to_string(), &limit],
+        ).await?;
+        Ok(rows.iter().map(|row| MemoryMutation {
+            id: row.get("id"),
+            memory_id: row.get("memory_id"),
+            action: row.get("action"),
+            old_content: row.get("old_content"),
+            new_content: row.get("new_content"),
+            timestamp: row.get("timestamp"),
+        }).collect())
+    }
+
+    // Document revisions
+
+    async fn insert_revision(&self, rel_path: &str, hash: &str, body: &str, source: &str, operation: &str) -> Result<i64> {
+        let rows = self.query(
+            "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM document_revisions WHERE rel_path = $1",
+            &[&rel_path.to_string()],
+        ).await?;
+        let seq: i64 = rows.first().map(|r| r.get("next_seq")).unwrap_or(1);
+        let id = format!("rev-{}", &ulid::Ulid::new().to_string()[..12]);
+        self.execute(
+            "INSERT INTO document_revisions (id, rel_path, seq, hash, body, source, operation, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            &[
+                &id,
+                &rel_path.to_string(),
+                &seq,
+                &hash.to_string(),
+                &body.to_string(),
+                &source.to_string(),
+                &operation.to_string(),
+                &chrono::Utc::now().to_rfc3339(),
+            ],
+        ).await?;
+        Ok(seq)
+    }
+
+    async fn list_revisions(&self, rel_path: &str, limit: i64) -> Result<Vec<DocumentRevision>> {
+        let rows = self.query(
+            "SELECT id, rel_path, seq, hash, '' AS body, source, operation, created_at FROM document_revisions WHERE rel_path = $1 ORDER BY seq DESC LIMIT $2",
+            &[&rel_path.to_string(), &limit],
+        ).await?;
+        Ok(rows.iter().map(row_to_revision).collect())
+    }
+
+    async fn get_revision(&self, rel_path: &str, seq: i64) -> Result<Option<DocumentRevision>> {
+        let rows = self.query(
+            "SELECT id, rel_path, seq, hash, body, source, operation, created_at FROM document_revisions WHERE rel_path = $1 AND seq = $2",
+            &[&rel_path.to_string(), &seq],
+        ).await?;
+        Ok(rows.first().map(row_to_revision))
+    }
+
+    async fn get_revision_by_hash(&self, rel_path: &str, hash: &str) -> Result<Option<DocumentRevision>> {
+        let rows = self.query(
+            "SELECT id, rel_path, seq, hash, body, source, operation, created_at FROM document_revisions WHERE rel_path = $1 AND hash = $2 ORDER BY seq DESC LIMIT 1",
+            &[&rel_path.to_string(), &hash.to_string()],
+        ).await?;
+        Ok(rows.first().map(row_to_revision))
+    }
+
+    // Transcript sync watermarks
+
+    async fn get_watermark(&self, tool: &str, path: &str) -> Result<Option<TranscriptWatermark>> {
+        let rows = self.query(
+            "SELECT tool, transcript_path, last_line, prefix_hash, last_synced_at FROM transcript_watermarks WHERE tool = $1 AND transcript_path = $2",
+            &[&tool.to_string(), &path.to_string()],
+        ).await?;
+        Ok(rows.first().map(|row| TranscriptWatermark {
+            tool: row.get("tool"),
+            transcript_path: row.get("transcript_path"),
+            last_line: row.get("last_line"),
+            prefix_hash: row.get("prefix_hash"),
+            last_synced_at: row.get("last_synced_at"),
+        }))
+    }
+
+    async fn upsert_watermark(&self, w: &TranscriptWatermark) -> Result<()> {
+        self.execute(
+            "INSERT INTO transcript_watermarks (tool, transcript_path, last_line, prefix_hash, last_synced_at) VALUES ($1,$2,$3,$4,$5)
+             ON CONFLICT (tool, transcript_path) DO UPDATE SET last_line = EXCLUDED.last_line, prefix_hash = EXCLUDED.prefix_hash, last_synced_at = EXCLUDED.last_synced_at",
+            &[&w.tool, &w.transcript_path, &w.last_line, &w.prefix_hash, &w.last_synced_at],
+        ).await?;
+        Ok(())
+    }
+
+    // Gaps report support
+
+    async fn zero_hit_queries(&self, limit: i64) -> Result<Vec<ZeroHitQuery>> {
+        let rows = self.query(
+            "SELECT query, COUNT(*) AS hits, MAX(created_at) AS last_seen FROM queries WHERE zero_hit GROUP BY query ORDER BY last_seen DESC LIMIT $1",
+            &[&limit],
+        ).await?;
+        Ok(rows.iter().map(|row| ZeroHitQuery {
+            query: row.get("query"),
+            hits: row.get("hits"),
+            last_seen: row.get("last_seen"),
+        }).collect())
     }
 
     async fn upsert_entity(&self, id: &str, name: &str, entity_type: &str, source_doc: &str) -> Result<()> {

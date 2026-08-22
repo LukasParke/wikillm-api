@@ -13,6 +13,13 @@ use wikillm_api::services::graph::GraphService;
 use wikillm_api::services::keys::EnvKeyEntry;
 use wikillm_api::services::metrics::MetricsRegistry;
 use wikillm_api::services::okf_service::OkfService;
+use wikillm_api::ingest::transcripts::TranscriptScanner;
+use wikillm_api::services::communities::CommunitiesService;
+use wikillm_api::services::improver::ImproverService;
+use wikillm_api::services::kg::KnowledgeGraphService;
+use wikillm_api::services::memory::MemoryService;
+use wikillm_api::services::promote::PromotionService;
+use wikillm_api::services::sessions::SessionService;
 use wikillm_api::services::project::ProjectService;
 use wikillm_api::services::search::SearchService;
 use wikillm_api::services::settings::SettingsService;
@@ -145,6 +152,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let pipeline = pipeline.clone();
             let broadcaster = broadcaster.clone();
             let webhooks = webhooks.clone();
+            let store = store.clone();
+            let wiki_root = config.wiki_root.clone();
             tokio::spawn(async move {
                 while let Some(paths) = rx.recv().await {
                     for rel in paths {
@@ -152,10 +161,32 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             .handle_file_change(&rel, Default::default())
                             .await
                         {
-                            broadcaster.broadcast(&wikillm_api::domain::ChangeEvent {
-                                event_type: "change".into(),
-                                data: event.clone(),
-                            });
+                            // Append-only revision capture for external edits
+                            // (wave 3): the pipeline already indexed the new
+                            // body, so record it verbatim under the watcher
+                            // actor. API writes record their own revisions in
+                            // the write path, so only "modified" lands here.
+                            if event.change_type == "modified" {
+                                let abs = std::path::Path::new(&wiki_root).join(&rel);
+                                match std::fs::read_to_string(&abs) {
+                                    Ok(body) => {
+                                        let hash = wikillm_api::fs::atomic::hash_content(&body);
+                                        if let Err(e) = store
+                                            .insert_revision(&rel, &hash, &body, "watcher", "update")
+                                            .await
+                                        {
+                                            eprintln!("revision capture failed for {rel}: {e}");
+                                        }
+                                    }
+                                    Err(_) => {} // binary/non-utf8 file; skip revision capture
+                                }
+                            }
+                            broadcaster
+                                .broadcast(&wikillm_api::domain::ChangeEvent {
+                                    event_type: "change".into(),
+                                    data: event.clone(),
+                                })
+                                .await;
                             webhooks.dispatch(&event).await;
                         }
                     }
@@ -209,16 +240,104 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Memory-loop services (wave 3). KG first: CommunitiesService borrows
+    // its detection cache.
+    let memory = Arc::new(MemoryService::new(store.clone()));
+    let sessions = Arc::new(SessionService::new(store.clone(), settings.clone()));
+    let kg = Arc::new(KnowledgeGraphService::new(store.clone()));
+    let communities = Arc::new(CommunitiesService::new(kg.clone(), store.clone()));
+    let promotion_embedder = wikillm_api::llm::embedder::resolve_embedder(
+        &settings
+            .get_string("embedding_provider")
+            .await
+            .unwrap_or_else(|_| "auto".into()),
+        &llm_base_url,
+        Some(api_key.as_str()),
+        &settings.get_string("llm_embed_model").await.unwrap_or_default(),
+        config.embedding_dims,
+    );
+    let promotion = Arc::new(PromotionService::new(
+        store.clone(),
+        settings.clone(),
+        llm_holder.read().ok().and_then(|g| g.clone()),
+        promotion_embedder,
+        std::path::PathBuf::from(&config.wiki_root).join("derived/promotions"),
+    ));
+
+    // Improver maintenance loop; interval comes from the settings registry
+    // and `improver_interval_seconds == 0` exits the loop immediately.
+    {
+        let improver = Arc::new(ImproverService::new(
+            store.clone(),
+            memory.clone(),
+            settings.clone(),
+            config.wiki_root.clone(),
+            Vec::new(),
+        ));
+        let llm = llm_holder.read().ok().and_then(|g| g.clone());
+        let max_llm_calls =
+            settings.get_i64("improver_max_llm_calls").await.unwrap_or(4).clamp(0, 1000) as u32;
+        let interval = settings.get_i64("improver_interval_seconds").await.unwrap_or(3600);
+        let interval = if interval < 0 { 0 } else { interval as u64 };
+        tokio::spawn(async move {
+            improver.run_forever(llm, max_llm_calls, interval).await;
+        });
+    }
+
+    // Coding-agent transcript sync loop. The enable gate is re-checked each
+    // tick so flipping `transcript_sync_enabled` at runtime takes effect
+    // within one interval without a restart.
+    {
+        let roots: Vec<std::path::PathBuf> = settings
+            .get_string("transcript_roots")
+            .await
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .collect();
+        let scanner = TranscriptScanner::new(store.clone(), roots, sessions.clone())
+            .with_llm(llm_holder.read().ok().and_then(|g| g.clone()));
+        let settings = settings.clone();
+        tokio::spawn(async move {
+            loop {
+                let secs = settings.get_i64("transcript_interval_seconds").await.unwrap_or(60);
+                let secs = if secs < 5 { 5 } else { secs as u64 };
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                if !settings
+                    .get_bool("transcript_sync_enabled")
+                    .await
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                match scanner.sync_all().await {
+                    Ok(stats) => {
+                        if stats.messages_ingested > 0 || stats.rescans > 0 {
+                            println!(
+                                "transcript sync: scanned={} sessions={} ingested={} skipped={} rescans={}",
+                                stats.scanned,
+                                stats.discovered_sessions,
+                                stats.messages_ingested,
+                                stats.skipped_lines,
+                                stats.rescans
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!("transcript sync failed: {e}"),
+                }
+            }
+        });
+    }
+
+
     let search = Arc::new(SearchService::new(store.clone(), llm_holder.clone()));
     let graph = Arc::new(GraphService::new(store.clone()));
     let projects = Arc::new(ProjectService::new(store.clone()));
     let okf = Arc::new(OkfService::new(config.clone(), layout_setting_handle()));
     let metrics = Arc::new(MetricsRegistry::new());
     let rate_limiter = Arc::new(RateLimiter::new());
-    let auth_state = wikillm_api::http::auth::AuthState {
-        registry: keys.clone(),
-        public_read: public_read_handle(&settings),
-    };
 
     let state = AppState {
         config: Arc::new(config),
@@ -234,8 +353,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         rate_limiter,
         search,
         llm_holder: llm_holder.clone(),
+        memory,
+        sessions,
+        communities,
+        promotion,
+        kg,
     };
-    let _ = auth_state; // auth resolved per-request via keys registry
 
     let router = http::build_router(state);
     let listener = tokio::net::TcpListener::bind((config_host(), config_port())).await?;
@@ -250,24 +373,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     fn layout_setting_handle() -> Arc<tokio::sync::RwLock<String>> {
         Arc::new(tokio::sync::RwLock::new(std::env::var("LAYOUT").unwrap_or_else(|_| "auto".into())))
     }
-    fn public_read_handle(settings: &Arc<SettingsService>) -> Arc<tokio::sync::RwLock<bool>> {
-        let handle = Arc::new(tokio::sync::RwLock::new(true));
-        let weak = Arc::downgrade(&handle);
-        let settings = settings.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                if let Some(h) = weak.upgrade() {
-                    if let Ok(v) = settings.get_bool("public_read").await {
-                        *h.write().await = v;
-                    }
-                } else {
-                    break;
-                }
-            }
-        });
-        handle
-    }
+
     fn void_dispatch(webhooks: Arc<WebhookDispatcher>, event: wikillm_api::domain::ChangeEventData) {
         tokio::spawn(async move {
             webhooks.dispatch(&event).await;

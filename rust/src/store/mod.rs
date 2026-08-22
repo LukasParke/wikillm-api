@@ -140,10 +140,47 @@ pub trait Store: Send + Sync {
     async fn delete_setting(&self, key: &str) -> Result<bool>;
 
     // Agent memory ledger
-    async fn insert_memory(&self, scope_key: &str, memory_type: &str, content: &str, content_hash: &str) -> Result<()>;
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_memory(
+        &self,
+        scope_key: &str,
+        memory_type: &str,
+        content: &str,
+        content_hash: &str,
+        source_session_id: Option<&str>,
+        source_ref: Option<&str>,
+        promote_candidate: Option<bool>,
+    ) -> Result<String>;
     async fn search_memories(&self, scope_key: &str, query: &str, limit: i64) -> Result<Vec<crate::services::memory::AgentMemory>>;
     async fn update_memory(&self, id: &str, new_content: &str, new_hash: &str) -> Result<()>;
     async fn delete_memory(&self, id: &str) -> Result<bool>;
+
+    // Promotion support (consumed by services/promote.rs)
+    /// Unpromoted promote-candidate memories, oldest first.
+    async fn list_promotable_memories(&self, limit: i64) -> Result<Vec<crate::services::memory::AgentMemory>>;
+    async fn mark_memory_promoted(&self, id: &str, promoted_at: &str) -> Result<()>;
+
+    // Memory mutation ledger (append-only audit trail per memory)
+    async fn record_memory_mutation(&self, m: &MemoryMutation) -> Result<()>;
+    async fn list_memory_mutations(&self, memory_id: &str, limit: i64) -> Result<Vec<MemoryMutation>>;
+
+    // Document revisions (append-only version history per rel_path)
+    /// Append a revision; seq is monotonic per rel_path. Returns the assigned seq.
+    async fn insert_revision(&self, rel_path: &str, hash: &str, body: &str, source: &str, operation: &str) -> Result<i64>;
+    /// Revision metadata WITHOUT body, newest first.
+    async fn list_revisions(&self, rel_path: &str, limit: i64) -> Result<Vec<DocumentRevision>>;
+    /// Single revision WITH body.
+    async fn get_revision(&self, rel_path: &str, seq: i64) -> Result<Option<DocumentRevision>>;
+    /// Most recent revision matching a hash, WITH body.
+    async fn get_revision_by_hash(&self, rel_path: &str, hash: &str) -> Result<Option<DocumentRevision>>;
+
+    // Coding-agent transcript sync watermarks
+    async fn get_watermark(&self, tool: &str, path: &str) -> Result<Option<TranscriptWatermark>>;
+    async fn upsert_watermark(&self, w: &TranscriptWatermark) -> Result<()>;
+
+    // Gaps report support
+    /// Recent zero-hit query texts with occurrence counts, most recent first.
+    async fn zero_hit_queries(&self, limit: i64) -> Result<Vec<ZeroHitQuery>>;
 
     // Knowledge graph entities
     async fn upsert_entity(&self, id: &str, name: &str, entity_type: &str, source_doc: &str) -> Result<()>;
@@ -151,6 +188,69 @@ pub trait Store: Send + Sync {
 
     // Maintenance
     async fn delete_derived_for_origin(&self, origin: &str) -> Result<()>;
+}
+
+/// Row structs for the versioning/memory-ledger subsystems. Defined here
+/// rather than domain.rs per the wave-1 ownership split; INTEGRATION-A may
+/// re-export them from domain.rs later.
+
+/// Append-only revision of a wiki document. `body` is only populated by
+/// [`Store::get_revision`] / [`Store::get_revision_by_hash`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DocumentRevision {
+    pub id: String,
+    pub rel_path: String,
+    pub seq: i64,
+    pub hash: String,
+    #[serde(default)]
+    pub body: String,
+    pub source: Option<String>,
+    pub operation: String,
+    pub created_at: String,
+}
+
+/// Append-only mutation record for one agent memory.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MemoryMutation {
+    pub id: String,
+    pub memory_id: String,
+    pub action: String,
+    #[serde(default)]
+    pub old_content: Option<String>,
+    #[serde(default)]
+    pub new_content: Option<String>,
+    pub timestamp: String,
+}
+
+/// High-water mark for incremental coding-agent transcript ingestion.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TranscriptWatermark {
+    pub tool: String,
+    pub transcript_path: String,
+    pub last_line: i64,
+    pub prefix_hash: Option<String>,
+    pub last_synced_at: Option<String>,
+}
+
+/// One aggregated zero-hit query text for the gaps report.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ZeroHitQuery {
+    pub query: String,
+    pub hits: i64,
+    pub last_seen: String,
+}
+
+/// Escape `\`, `%`, `_` in user input so it is safe inside a SQL LIKE
+/// pattern when the statement declares `ESCAPE '\'`.
+pub(crate) fn like_escape(q: &str) -> String {
+    let mut out = String::with_capacity(q.len());
+    for c in q.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 pub mod pg;

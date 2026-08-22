@@ -1,4 +1,6 @@
-//! Registry of the 41 MCP tools exposed over stdio, ported from `src/mcp/tools.ts`.
+//! Registry of the MCP tools exposed over stdio, ported from `src/mcp/tools.ts`
+//! and extended with the wave-3 memory-loop tools (memory ledger, sessions,
+//! version history/diffs, communities, gaps report, promotion).
 //!
 //! Each tool carries its JSON-Schema-ish `inputSchema` (as a raw `serde_json`
 //! object mirroring the zod definition) plus an async handler taking the call
@@ -322,8 +324,8 @@ fn arr(items: Value) -> Value {
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
-
-/// All 41 tools in registration order matching the TS reference.
+/// All registered tools: the TS-reference set first, then the memory-loop
+/// extensions appended by the wave-3 integration.
 pub fn tools() -> Vec<Tool> {
     vec![
         Tool {
@@ -1497,6 +1499,289 @@ pub fn tools() -> Vec<Tool> {
                 let data = api(&client, reqwest::Method::GET, "/v1/okf/layout", Body::None)
                     .await
                     .map_err(|e| e.to_string())?;
+                Ok(pretty(&data))
+            }),
+        },
+        // -- memory ledger ---------------------------------------------------
+        Tool {
+            name: "memory_store",
+            description: "Store a memory in the agent memory ledger. Dedupes and updates in place when near-identical content already exists; returns the applied action (add/update/noop) plus the mutation record.",
+            input_schema: schema(json!({
+                "content": s("Memory content to store"),
+                "memory_type": { "type": "string", "enum": ["semantic", "episodic", "procedural", "preference"], "description": "Memory kind (default semantic)" },
+                "session_id": s_plain(),
+                "agent_name": s("Owning agent name (defaults to the API key identity)"),
+                "source_ref": s("Optional provenance reference, e.g. a transcript path"),
+            })),
+            handler: handler!(client, args, {
+                let content = required_str(&args, "content")?;
+                let mut body = json!({ "content": content });
+                if let Some(t) = arg_str(&args, "memory_type") {
+                    body["memory_type"] = json!(t);
+                }
+                if let Some(v) = arg_str(&args, "session_id") {
+                    body["session_id"] = json!(v);
+                }
+                if let Some(v) = arg_str(&args, "agent_name") {
+                    body["agent_name"] = json!(v);
+                }
+                if let Some(v) = arg_str(&args, "source_ref") {
+                    body["source_ref"] = json!(v);
+                }
+                let data = api(&client, reqwest::Method::POST, "/v1/memory", Body::Json(body))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let action = data.get("action").and_then(Value::as_str).unwrap_or("noop");
+                let effective = data
+                    .pointer("/memory/content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                Ok(format!("stored (action: {action}): {effective}"))
+            }),
+        },
+        Tool {
+            name: "memory_search",
+            description: "Search the agent memory ledger for the authenticated identity's scope; hits have their access counter bumped.",
+            input_schema: schema(json!({
+                "q": s("Query text (empty lists recent memories)"),
+                "limit": i(1, 200, json!(20)),
+                "memory_type": s_plain(),
+                "agent": s_plain(),
+                "session_id": s_plain(),
+            })),
+            handler: handler!(client, args, {
+                let mut qs = query_from(&args, &["q", "memory_type", "agent", "session_id"]);
+                let limit = arg_i64(&args, "limit").unwrap_or(20);
+                if !qs.is_empty() {
+                    qs.push('&');
+                }
+                qs.push_str(&format!("limit={limit}"));
+                let data = api(&client, reqwest::Method::GET, &format!("/v1/memory?{qs}"), Body::None)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let memories = data.get("memories").and_then(Value::as_array).cloned().unwrap_or_default();
+                if memories.is_empty() {
+                    return Ok("no memories found".into());
+                }
+                let mut lines = Vec::new();
+                for m in &memories {
+                    let content = m.get("content").and_then(Value::as_str).unwrap_or("");
+                    let mt = m.get("memory_type").and_then(Value::as_str).unwrap_or("");
+                    let agent = m.get("agent_name").and_then(Value::as_str).unwrap_or("");
+                    lines.push(format!("- [{mt}] ({agent}) {content}"));
+                }
+                Ok(format!("{} memory hit(s):\n{}", lines.len(), lines.join("\n")))
+            }),
+        },
+        Tool {
+            name: "memory_history",
+            description: "List the append-only mutation ledger for one memory (add/update/delete/noop entries).",
+            input_schema: schema(json!({
+                "memory_id": s("Memory id"),
+                "limit": i(1, 500, json!(100)),
+            })),
+            handler: handler!(client, args, {
+                let id = required_str(&args, "memory_id")?;
+                let limit = arg_i64(&args, "limit").unwrap_or(100);
+                let data = api(
+                    &client,
+                    reqwest::Method::GET,
+                    &format!("/v1/memory/{}/history?limit={limit}", enc_query(&id)),
+                    Body::None,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                Ok(pretty(&data))
+            }),
+        },
+        // -- sessions ----------------------------------------------------------
+        Tool {
+            name: "session_start",
+            description: "Start an agent session; relevant memories for the scope are injected automatically and the injected count is returned.",
+            input_schema: schema(json!({
+                "agent_name": s("Agent name (defaults to the API key identity)"),
+            })),
+            handler: handler!(client, args, {
+                let mut body = json!({});
+                if let Some(v) = arg_str(&args, "agent_name") {
+                    body["agent_name"] = json!(v);
+                }
+                let data = api(&client, reqwest::Method::POST, "/v1/sessions", Body::Json(body))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let session = data.get("session").cloned().unwrap_or(Value::Null);
+                let id = session.get("id").and_then(Value::as_str).unwrap_or("");
+                let injected = data
+                    .get("injected_memory_count")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                Ok(format!("session {id} started ({injected} memories injected)"))
+            }),
+        },
+        Tool {
+            name: "session_message",
+            description: "Append one conversation message to a session; durable facts are extracted (LLM when configured, heuristics otherwise) and stored as memories. Returns the stored facts.",
+            input_schema: schema(json!({
+                "session_id": s("Session id"),
+                "role": s_plain(),
+                "content": s("Message content"),
+            })),
+            handler: handler!(client, args, {
+                let session_id = required_str(&args, "session_id")?;
+                let role = required_str(&args, "role")?;
+                let content = required_str(&args, "content")?;
+                let data = api(
+                    &client,
+                    reqwest::Method::POST,
+                    &format!("/v1/sessions/{}/messages", enc_query(&session_id)),
+                    Body::Json(json!({ "role": role, "content": content })),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                let stored = data.get("stored").and_then(Value::as_array).cloned().unwrap_or_default();
+                if stored.is_empty() {
+                    return Ok("message ingested; no durable facts extracted".into());
+                }
+                let mut lines = Vec::new();
+                for f in &stored {
+                    let c = f.get("content").and_then(Value::as_str).unwrap_or("");
+                    let t = f.get("memory_type").and_then(Value::as_str).unwrap_or("");
+                    lines.push(format!("- [{t}] {c}"));
+                }
+                Ok(format!("stored {} fact(s):\n{}", lines.len(), lines.join("\n")))
+            }),
+        },
+        Tool {
+            name: "session_get",
+            description: "Fetch a session (id, agent, user, created_at) plus the memories currently in its scope.",
+            input_schema: schema(json!({
+                "session_id": s("Session id"),
+            })),
+            handler: handler!(client, args, {
+                let session_id = required_str(&args, "session_id")?;
+                let data = api(
+                    &client,
+                    reqwest::Method::GET,
+                    &format!("/v1/sessions/{}", enc_query(&session_id)),
+                    Body::None,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                Ok(pretty(&data))
+            }),
+        },
+        // -- version history / diffs -------------------------------------------
+        Tool {
+            name: "page_versions",
+            description: "List the revision history of a page (seq, hash, source actor, operation, created_at) newest-first; bodies are not included.",
+            input_schema: schema(json!({
+                "path": s("Page path, e.g. 'concepts/occ.md'"),
+                "limit": i(1, 500, json!(50)),
+            })),
+            handler: handler!(client, args, {
+                let path = required_str(&args, "path")?;
+                let limit = arg_i64(&args, "limit").unwrap_or(50);
+                let data = api(
+                    &client,
+                    reqwest::Method::GET,
+                    &format!("/v1/pages/{}/versions?limit={limit}", enc_path(&path)),
+                    Body::None,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                Ok(pretty(&data))
+            }),
+        },
+        Tool {
+            name: "page_diff",
+            description: "Unified text diff between two revisions of a page. `from`/`to` accept a revision seq, a revision hash, or the literal 'current'.",
+            input_schema: schema(json!({
+                "path": s("Page path, e.g. 'concepts/occ.md'"),
+                "from": s("From revision: seq | hash | current"),
+                "to": s("To revision: seq | hash | current (default current)"),
+            })),
+            handler: handler!(client, args, {
+                let path = required_str(&args, "path")?;
+                let from = required_str(&args, "from")?;
+                let to = arg_str(&args, "to").unwrap_or("current");
+                let body = api(
+                    &client,
+                    reqwest::Method::GET,
+                    &format!(
+                        "/v1/pages/{}/diff?from={}&to={}",
+                        enc_path(&path),
+                        enc_query(&from),
+                        enc_query(to)
+                    ),
+                    Body::None,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                let text = body.as_str().unwrap_or("");
+                Ok(truncate(text, 6000))
+            }),
+        },
+        // -- communities / gaps / promotion --------------------------------------
+        Tool {
+            name: "gaps_report",
+            description: "Corpus-gap report: recent zero-hit query texts with hit counts (admin).",
+            input_schema: schema(json!({
+                "limit": i(1, 500, json!(50)),
+            })),
+            handler: handler!(client, args, {
+                let limit = arg_i64(&args, "limit").unwrap_or(50);
+                let data = api(&client, reqwest::Method::GET, &format!("/v1/admin/gaps?limit={limit}"), Body::None)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(pretty(&data))
+            }),
+        },
+        Tool {
+            name: "communities_list",
+            description: "List detected communities over the union of wikilink edges and active typed relations, with member counts.",
+            input_schema: schema(json!({})),
+            handler: handler!(client, _args, {
+                let data = api(&client, reqwest::Method::GET, "/v1/communities", Body::None)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(pretty(&data))
+            }),
+        },
+        Tool {
+            name: "communities_docs",
+            description: "List the member documents of one detected community by id.",
+            input_schema: schema(json!({
+                "id": s("Community id"),
+            })),
+            handler: handler!(client, args, {
+                let id = required_str(&args, "id")?;
+                let data = api(
+                    &client,
+                    reqwest::Method::GET,
+                    &format!("/v1/communities/{}/docs", enc_query(&id)),
+                    Body::None,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                Ok(pretty(&data))
+            }),
+        },
+        Tool {
+            name: "promote_run",
+            description: "Trigger one promotion pass: clusters promote-candidate memories and synthesizes draft wiki pages from them (admin; no-op unless promotion_enabled is set).",
+            input_schema: schema(json!({
+                "limit": i(0, 100, json!(0)),
+            })),
+            handler: handler!(client, args, {
+                let limit = arg_i64(&args, "limit").unwrap_or(0);
+                let data = api(
+                    &client,
+                    reqwest::Method::POST,
+                    "/v1/admin/promote",
+                    Body::Json(json!({ "limit": limit })),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
                 Ok(pretty(&data))
             }),
         },

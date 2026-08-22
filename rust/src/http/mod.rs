@@ -2,6 +2,7 @@
 //! SSE/WebSocket change feeds.
 
 pub mod auth;
+pub mod diffutil;
 pub mod rate_limit;
 pub mod routes;
 
@@ -16,6 +17,7 @@ use crate::ingest::pipeline::IndexPipeline;
 use crate::services::broadcaster::Broadcaster;
 use crate::services::graph::GraphService;
 use crate::services::keys::KeyRegistry;
+use crate::services::memory::{memory_type_to_str, MemoryScope};
 use crate::services::metrics::MetricsRegistry;
 use crate::services::okf_service::OkfService;
 use crate::services::project::ProjectService;
@@ -48,6 +50,12 @@ pub struct AppState {
     pub rate_limiter: Arc<RateLimiter>,
     pub search: Arc<SearchService>,
     pub llm_holder: Arc<std::sync::RwLock<Option<crate::llm::provider::DynLlmProvider>>>,
+    // Memory-loop services (wave 3; constructed in main.rs by INTEGRATION-B)
+    pub memory: Arc<crate::services::memory::MemoryService>,
+    pub sessions: Arc<crate::services::sessions::SessionService>,
+    pub communities: Arc<crate::services::communities::CommunitiesService>,
+    pub promotion: Arc<crate::services::promote::PromotionService>,
+    pub kg: Arc<crate::services::kg::KnowledgeGraphService>,
 }
 
 pub type HttpResult<T> = Result<T, (StatusCode, Json<Value>)>;
@@ -198,6 +206,23 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/entities/{entity_id}/history",
             get(entity_history),
         )
+        // -- memory ledger -------------------------------------------------------
+        .route("/v1/memory", post(memory_create).get(memory_list))
+        .route("/v1/memory/{id}/history", get(memory_history))
+        .route("/v1/memory/{id}", delete(memory_delete))
+        // -- sessions ------------------------------------------------------------
+        .route("/v1/sessions", post(session_create))
+        .route("/v1/sessions/{id}/messages", post(session_message))
+        .route("/v1/sessions/{id}", get(session_get))
+        // -- version history / diffs ----------------------------------------------
+        // Versions & diff ride the /v1/pages wildcard via suffix dispatch
+        // inside page_get (axum catch-all segments must be last).
+        // -- communities ----------------------------------------------------------
+        .route("/v1/communities", get(communities_list))
+        .route("/v1/communities/{id}/docs", get(communities_docs))
+        // -- admin ------------------------------------------------------------------
+        .route("/v1/admin/gaps", get(admin_gaps))
+        .route("/v1/admin/promote", post(admin_promote))
         .with_state(state)
 }
 
@@ -230,7 +255,8 @@ async fn self_description(State(_state): State<AppState>) -> Json<Value> {
             "/v1/log", "/v1/search", "/v1/query", "/v1/changes", "/v1/events",
             "/v1/ws", "/v1/ingest", "/v1/graph", "/v1/okf", "/v1/bundle",
             "/v1/connectors", "/v1/projects", "/v1/settings", "/v1/keys",
-            "/v1/admin", "/v1/feedback", "/v1/webhooks"
+            "/v1/admin", "/v1/feedback", "/v1/webhooks", "/v1/memory",
+            "/v1/sessions", "/v1/communities"
         ],
     }))
 }
@@ -307,8 +333,15 @@ async fn page_get(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumPath(rel_path): AxumPath<String>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> HttpResult<Response> {
     require_auth!(state, headers, true);
+    // Sub-resources share the wildcard route because axum catch-all
+    // segments must be last: <path>/versions, <path>/versions/:seq,
+    // <path>/diff — dispatched here exactly like the legacy /raw suffix.
+    if let Some(response) = page_subresource(&state, &rel_path, &q).await? {
+        return Ok(response);
+    }
     let raw_mode = rel_path.ends_with("/raw");
     let rel_path = if raw_mode {
         rel_path.trim_end_matches("/raw").to_string()
@@ -338,6 +371,119 @@ async fn read_page_record(
     state.store.get_document(rel_path).await.map_err(|e| map_err(&e))
 }
 
+/// Dispatch version-history / diff sub-resources suffixed onto the page
+/// wildcard. Returns `Ok(None)` when the path is an ordinary page path.
+async fn page_subresource(
+    state: &AppState,
+    rel_path: &str,
+    q: &std::collections::HashMap<String, String>,
+) -> Result<Option<Response>, (StatusCode, Json<Value>)> {
+    if let Some((base, seq_str)) = rel_path.rsplit_once("/versions/") {
+        // A non-numeric tail means the document itself lives under a
+        // "versions" folder segment — fall through to the normal read.
+        if let Ok(seq) = seq_str.parse::<i64>() {
+            return page_version_raw(state, base, seq).await.map(Some);
+        }
+    }
+    if let Some(base) = rel_path.strip_suffix("/versions") {
+        if !base.is_empty() {
+            return page_versions(state, base, q).await.map(Some);
+        }
+    }
+    if let Some(base) = rel_path.strip_suffix("/diff") {
+        if !base.is_empty() {
+            return page_diff(state, base, q).await.map(Some);
+        }
+    }
+    Ok(None)
+}
+
+async fn page_versions(
+    state: &AppState,
+    rel_path: &str,
+    q: &std::collections::HashMap<String, String>,
+) -> HttpResult<Response> {
+    crate::fs::paths::resolve_wiki_path(&state.config.wiki_root, rel_path)
+        .map_err(|e| map_err(&e))?;
+    let limit: i64 = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(50);
+    // list_revisions returns metadata only; bodies stay out of the listing.
+    let versions = state.store.list_revisions(rel_path, limit).await.map_err(|e| map_err(&e))?;
+    Ok(Json(json!({ "rel_path": rel_path, "versions": versions })).into_response())
+}
+
+async fn page_version_raw(
+    state: &AppState,
+    rel_path: &str,
+    seq: i64,
+) -> HttpResult<Response> {
+    crate::fs::paths::resolve_wiki_path(&state.config.wiki_root, rel_path)
+        .map_err(|e| map_err(&e))?;
+    match state.store.get_revision(rel_path, seq).await.map_err(|e| map_err(&e))? {
+        Some(rev) => {
+            let mut response = (StatusCode::OK, rev.body).into_response();
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                "text/markdown; charset=utf-8".parse().unwrap(),
+            );
+            Ok(response)
+        }
+        None => Err(err_status(StatusCode::NOT_FOUND, "not_found", &format!("Revision not found: {rel_path}@{seq}"))),
+    }
+}
+
+async fn page_diff(
+    state: &AppState,
+    rel_path: &str,
+    q: &std::collections::HashMap<String, String>,
+) -> HttpResult<Response> {
+    crate::fs::paths::resolve_wiki_path(&state.config.wiki_root, rel_path)
+        .map_err(|e| map_err(&e))?;
+    let from = q
+        .get("from")
+        .ok_or_else(|| err_status(StatusCode::BAD_REQUEST, "validation", "missing 'from' (seq|hash|current)"))?;
+    let to = q.get("to").map(String::as_str).unwrap_or("current");
+    let from_body = resolve_revision_body(state, rel_path, from).await?;
+    let to_body = resolve_revision_body(state, rel_path, to).await?;
+    let diff = crate::http::diffutil::unified_diff(
+        &format!("{rel_path}@{from}"),
+        &format!("{rel_path}@{to}"),
+        &from_body,
+        &to_body,
+        3,
+    );
+    let mut response = (StatusCode::OK, diff).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        "text/plain; charset=utf-8".parse().unwrap(),
+    );
+    Ok(response)
+}
+
+/// Resolve a diff endpoint spec — a revision `seq`, a revision `hash`, or
+/// the literal `current` (the live document body) — to its text.
+async fn resolve_revision_body(
+    state: &AppState,
+    rel_path: &str,
+    spec: &str,
+) -> Result<String, (StatusCode, Json<Value>)> {
+    if spec == "current" {
+        return match read_page_record(state, rel_path).await? {
+            Some(doc) => Ok(doc.body.clone()),
+            None => Err(err_status(StatusCode::NOT_FOUND, "not_found", &format!("Page not found: {rel_path}"))),
+        };
+    }
+    let rev = if let Ok(seq) = spec.parse::<i64>() {
+        state.store.get_revision(rel_path, seq).await
+    } else {
+        state.store.get_revision_by_hash(rel_path, spec).await
+    }
+    .map_err(|e| map_err(&e))?;
+    match rev {
+        Some(r) => Ok(r.body),
+        None => Err(err_status(StatusCode::NOT_FOUND, "not_found", &format!("Revision not found: {rel_path}@{spec}"))),
+    }
+}
+
 async fn page_put(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -356,7 +502,7 @@ async fn page_delete(
     headers: HeaderMap,
     AxumPath(rel_path): AxumPath<String>,
 ) -> HttpResult<Json<Value>> {
-    let _ = require_auth!(state, headers, false);
+    let auth = require_auth!(state, headers, false);
     let doc = state.store.get_document(&rel_path).await.map_err(|e| map_err(&e))?;
     if doc.is_none() {
         return Err(err_status(StatusCode::NOT_FOUND, "not_found", "Page not found"));
@@ -372,6 +518,18 @@ async fn page_delete(
                 operation_id: None,
             },
         )
+        .await
+        .map_err(|e| map_err(&e))?;
+    // Append-only revision capture for deletions: empty body, hash of the
+    // last known content, actor derived from the authenticated principal.
+    let deleted_hash = doc
+        .as_ref()
+        .map(|d| d.hash.clone())
+        .unwrap_or_default();
+    let actor = actor_for(&state, &auth.name).await;
+    state
+        .store
+        .insert_revision(&rel_path, &deleted_hash, "", &actor, "delete")
         .await
         .map_err(|e| map_err(&e))?;
     Ok(Json(json!({ "success": true })))
@@ -471,6 +629,21 @@ pub(crate) async fn write_page_via_pipeline(
         )
         .await
         .map_err(|e| map_err(&e))?;
+
+    // Append-only revision capture (wave 3): `existing_hash` reflects the
+    // pre-write file, so its presence distinguishes update from create.
+    let operation = if existing_hash.is_some() { "update" } else { "create" };
+    state
+        .store
+        .insert_revision(
+            rel_path,
+            &crate::fs::atomic::hash_content(&file_body),
+            &file_body,
+            &actor,
+            operation,
+        )
+        .await
+        .map_err(|e| map_err(&e))?;
     Ok(())
 }
 
@@ -512,12 +685,19 @@ async fn batch_write(
     headers: HeaderMap,
     Json(body): Json<BatchBody>,
 ) -> HttpResult<Json<Value>> {
-    let _ = require_auth!(state, headers, false);
+    let auth = require_auth!(state, headers, false);
     let mut results = Vec::new();
     for op in &body.operations {
         if op.delete {
             let abs = std::path::Path::new(&state.config.wiki_root).join(&op.rel_path);
             let success = abs.exists();
+            // Fetch the prior record BEFORE the pipeline processes the
+            // deletion (it drops the documents row).
+            let prev = if success {
+                state.store.get_document(&op.rel_path).await.ok().flatten()
+            } else {
+                None
+            };
             if success {
                 std::fs::remove_file(&abs).map_err(|e| map_err(&Error::Io(e)))?;
                 state
@@ -531,6 +711,15 @@ async fn batch_write(
                     )
                     .await
                     .map_err(|e| map_err(&e))?;
+                // Append-only revision capture for batch deletions.
+                if let Some(prev) = prev {
+                    let actor = actor_for(&state, &auth.name).await;
+                    state
+                        .store
+                        .insert_revision(&op.rel_path, &prev.hash, "", &actor, "delete")
+                        .await
+                        .map_err(|e| map_err(&e))?;
+                }
             }
             results.push(json!({ "rel_path": op.rel_path, "success": success }));
         } else if let Some(content) = &op.content {
@@ -889,15 +1078,15 @@ async fn query_handler(
         .resolve_scope_prefixes(&auth.projects, body.project.as_deref())
         .await
         .map_err(|e| map_err(&e))?;
-    let filters = SearchFilters {
-        path_prefixes: if prefixes.first().map(String::as_str) == Some("*") { None } else { Some(prefixes) },
-        ..Default::default()
-    };
     let _llm = state
         .llm_holder
         .read()
         .ok()
         .and_then(|g| g.clone());
+    let filters = SearchFilters {
+        path_prefixes: if prefixes.first().map(String::as_str) == Some("*") { None } else { Some(prefixes) },
+        ..Default::default()
+    };
     let state_for_query = state.clone();
     let llm_getter: crate::services::query::LlmGetter = Box::new(move || {
         state_for_query
@@ -910,6 +1099,7 @@ async fn query_handler(
         state.store.clone(),
         llm_getter,
         state.search.clone(),
+        state.settings.clone(),
     );
     match query
         .answer(&body.question, Some(&filters), Some(auth.name.as_str()))
@@ -1629,4 +1819,327 @@ async fn entity_history(
     let relations = state.store.get_relations_for_entity(&entity_id, 500).await.map_err(|e| map_err(&e))?;
     let filtered: Vec<&serde_json::Value> = Vec::new(); // placeholder: full impl needs raw SQL access
     Ok(Json(json!({ "entity_id": entity_id, "as_of": as_of, "relations": [] })))
+}
+
+// -- memory ledger -------------------------------------------------------------
+
+fn parse_memory_type(s: &str) -> Option<crate::services::memory::MemoryType> {
+    match s {
+        "semantic" => Some(crate::services::memory::MemoryType::Semantic),
+        "episodic" => Some(crate::services::memory::MemoryType::Episodic),
+        "procedural" => Some(crate::services::memory::MemoryType::Procedural),
+        "preference" => Some(crate::services::memory::MemoryType::Preference),
+        _ => None,
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct MemoryCreateBody {
+    content: String,
+    #[serde(default)]
+    memory_type: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    source_ref: Option<String>,
+    #[serde(default)]
+    agent_name: Option<String>,
+}
+
+async fn memory_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<MemoryCreateBody>,
+) -> HttpResult<Json<Value>> {
+    let auth = require_auth!(state, headers, false);
+    let memory_type = match body.memory_type.as_deref() {
+        None => crate::services::memory::MemoryType::Semantic,
+        Some(t) => match parse_memory_type(t) {
+            Some(mt) => mt,
+            None => return Err(err_status(StatusCode::BAD_REQUEST, "validation", &format!("Unknown memory_type: {t}"))),
+        },
+    };
+    // The scope user always derives from the authenticated principal.
+    let scope = MemoryScope {
+        user_id: auth.name.clone(),
+        agent_name: Some(body.agent_name.clone().unwrap_or_else(|| auth.name.clone())),
+        session_id: body.session_id.clone(),
+    };
+    let llm = state.llm_holder.read().ok().and_then(|g| g.clone());
+    let mutations = state
+        .memory
+        .store_memory(
+            &scope,
+            memory_type,
+            &body.content,
+            llm.as_ref(),
+            body.session_id.as_deref(),
+            body.source_ref.as_deref(),
+        )
+        .await
+        .map_err(|e| map_err(&e))?;
+    let action = mutations
+        .last()
+        .map(|m| m.action.clone())
+        .unwrap_or_else(|| "noop".to_string());
+    let effective_content = mutations
+        .last()
+        .and_then(|m| m.new_content.clone())
+        .unwrap_or_else(|| body.content.clone());
+    Ok(Json(json!({
+        "memory": {
+            "user_id": auth.name,
+            "agent_name": scope.agent_name,
+            "content": effective_content,
+        },
+        "action": action,
+        "mutation": mutations.last(),
+        "mutations": mutations,
+    })))
+}
+
+#[derive(serde::Deserialize)]
+struct MemoryListQuery {
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(rename = "type")]
+    #[serde(default)]
+    memory_type: Option<String>,
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+async fn memory_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<MemoryListQuery>,
+) -> HttpResult<Json<Value>> {
+    let auth = require_auth!(state, headers, false);
+    let scope = MemoryScope {
+        user_id: auth.name.clone(),
+        agent_name: Some(q.agent.clone().unwrap_or_else(|| auth.name.clone())),
+        session_id: q.session_id.clone(),
+    };
+    let mut memories = state
+        .memory
+        .search_memories(&scope, q.q.as_deref().unwrap_or(""), q.limit.unwrap_or(50))
+        .await
+        .map_err(|e| map_err(&e))?;
+    if let Some(t) = &q.memory_type {
+        memories.retain(|m| memory_type_to_str(&m.memory_type) == t.as_str());
+    }
+    Ok(Json(json!({ "memories": memories })))
+}
+
+async fn memory_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> HttpResult<Json<Value>> {
+    let _ = require_auth!(state, headers, false);
+    let limit: i64 = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(100);
+    let mutations = state
+        .store
+        .list_memory_mutations(&id, limit)
+        .await
+        .map_err(|e| map_err(&e))?;
+    Ok(Json(json!({ "memory_id": id, "mutations": mutations })))
+}
+
+async fn memory_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> HttpResult<Json<Value>> {
+    let _ = require_auth!(state, headers, false);
+    let deleted = state.store.delete_memory(&id).await.map_err(|e| map_err(&e))?;
+    if !deleted {
+        return Err(err_status(StatusCode::NOT_FOUND, "not_found", &format!("Memory not found: {id}")));
+    }
+    // Append-only audit trail for the delete outcome (old content is not
+    // recoverable post-delete; the store keeps no get-by-id read path).
+    let mutation = crate::store::MemoryMutation {
+        id: format!("mm-{}", &ulid::Ulid::new().to_string()[..12].to_lowercase()),
+        memory_id: id.clone(),
+        action: "delete".into(),
+        old_content: None,
+        new_content: None,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+    state
+        .store
+        .record_memory_mutation(&mutation)
+        .await
+        .map_err(|e| map_err(&e))?;
+    Ok(Json(json!({ "success": true, "mutation": mutation })))
+}
+
+// -- sessions ------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct SessionCreateBody {
+    #[serde(default)]
+    agent_name: Option<String>,
+    // `user_id` is accepted for contract compatibility but deliberately
+    // ignored: the scope user ALWAYS derives from the authenticated
+    // principal and is never client-controlled.
+    #[allow(dead_code)]
+    #[serde(default)]
+    user_id: Option<String>,
+}
+async fn session_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SessionCreateBody>,
+) -> HttpResult<(StatusCode, Json<Value>)> {
+    let auth = require_auth!(state, headers, false);
+    let agent_name = body.agent_name.unwrap_or_else(|| auth.name.clone());
+    let (session, memories) = state
+        .sessions
+        .create(&agent_name, &auth.name)
+        .await
+        .map_err(|e| map_err(&e))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "session": session,
+            "injected_memory_count": memories.len(),
+        })),
+    ))
+}
+
+async fn session_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> HttpResult<Json<Value>> {
+    let _ = require_auth!(state, headers, false);
+    let session = state
+        .store
+        .get_session(&id)
+        .await
+        .map_err(|e| map_err(&e))?
+        .ok_or_else(|| err_status(StatusCode::NOT_FOUND, "not_found", &format!("Session not found: {id}")))?;
+    // Facts persist at the durable user|agent scope; recover THIS session's
+    // contributions by lineage (source_session_id), newest first.
+    let scope = MemoryScope {
+        user_id: session.user_id.clone(),
+        agent_name: Some(session.agent_name.clone()),
+        session_id: None,
+    };
+    let mut memories = state
+        .memory
+        .search_memories(&scope, "", 100)
+        .await
+        .unwrap_or_default();
+    memories.retain(|m| m.source_session_id.as_deref() == Some(session.id.as_str()));
+    memories.truncate(20);
+    Ok(Json(json!({
+        "session": session,
+        "memories": memories,
+    })))
+}
+
+#[derive(serde::Deserialize)]
+struct SessionMessageBody {
+    role: String,
+    content: String,
+}
+
+async fn session_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<SessionMessageBody>,
+) -> HttpResult<Json<Value>> {
+    let _ = require_auth!(state, headers, false);
+    let session = state
+        .store
+        .get_session(&id)
+        .await
+        .map_err(|e| map_err(&e))?
+        .ok_or_else(|| err_status(StatusCode::NOT_FOUND, "not_found", &format!("Session not found: {id}")))?;
+    let llm = state.llm_holder.read().ok().and_then(|g| g.clone());
+    let message = format!("{}: {}", body.role, body.content);
+    let stored = state
+        .sessions
+        .extract_and_store(&id, &session.agent_name, &session.user_id, &message, llm.as_ref())
+        .await
+        .map_err(|e| map_err(&e))?;
+    Ok(Json(json!({ "stored": stored })))
+}
+
+// -- communities ---------------------------------------------------------------
+
+async fn communities_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> HttpResult<Json<Value>> {
+    require_auth!(state, headers, true);
+    let communities = state.communities.list().await.map_err(|e| map_err(&e))?;
+    Ok(Json(json!({ "communities": communities })))
+}
+
+async fn communities_docs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> HttpResult<Json<Value>> {
+    require_auth!(state, headers, true);
+    match state.communities.docs(&id).await.map_err(|e| map_err(&e))? {
+        Some(docs) => Ok(Json(json!({ "community": id, "documents": docs }))),
+        None => Err(err_status(StatusCode::NOT_FOUND, "not_found", &format!("Community not found: {id}"))),
+    }
+}
+
+// -- gaps report / promotion ---------------------------------------------------
+
+async fn admin_gaps(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> HttpResult<Json<Value>> {
+    let auth = require_auth!(state, headers, true);
+    require_admin_role(&auth)?;
+    let limit: i64 = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(50);
+    let gaps = state.store.zero_hit_queries(limit).await.map_err(|e| map_err(&e))?;
+    let total_hits: i64 = gaps.iter().map(|g| g.hits).sum();
+    Ok(Json(json!({
+        "gaps": gaps,
+        "total": gaps.len(),
+        "total_hits": total_hits,
+    })))
+}
+
+#[derive(serde::Deserialize)]
+struct PromoteBody {
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+async fn admin_promote(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PromoteBody>,
+) -> HttpResult<Json<Value>> {
+    let auth = require_auth!(state, headers, false);
+    require_admin_role(&auth)?;
+    if !state.settings.get_bool("promotion_enabled").await.unwrap_or(false) {
+        return Err(err_status(
+            StatusCode::BAD_REQUEST,
+            "promotion_disabled",
+            "promotion_enabled setting is false",
+        ));
+    }
+    let pages = state
+        .promotion
+        .run(body.limit.unwrap_or(0))
+        .await
+        .map_err(|e| map_err(&e))?;
+    Ok(Json(json!({ "count": pages.len(), "promoted": pages })))
 }

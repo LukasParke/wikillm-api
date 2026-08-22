@@ -3,7 +3,7 @@
 //! FTS + optional vector search fused with Reciprocal Rank Fusion, decay and
 //! title boosts, optional LLM rerank, and neighbor-chunk context expansion.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -99,6 +99,74 @@ pub fn rrf_fuse(lists: &[Vec<String>], k: i64) -> Vec<(String, f64)> {
     order
 }
 
+/// Collapse near-duplicate hits: two items whose word-level 3-gram sets have
+/// Jaccard similarity above `NEAR_DUP_JACCARD` (lowercase alphanumeric word
+/// normalization) are considered duplicates and the lower-scoring one is
+/// dropped. Survivors come back in descending score order.
+pub const NEAR_DUP_JACCARD: f64 = 0.8;
+
+pub fn collapse_near_dups(hits: Vec<Scored>) -> Vec<Scored> {
+    let mut hits = hits;
+    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    collapse_by_content(hits, |scored| scored.hit.content.as_str(), NEAR_DUP_JACCARD)
+}
+
+/// Greedy near-duplicate collapse over arbitrary items: an item survives
+/// only if its content trigram set stays at or below `threshold` Jaccard
+/// similarity against every already-kept item; earlier items win ties, so
+/// callers should pass candidates in preference order.
+pub fn collapse_by_content<T>(
+    items: Vec<T>,
+    content_of: impl Fn(&T) -> &str,
+    threshold: f64,
+) -> Vec<T> {
+    let mut kept_sets: Vec<HashSet<String>> = Vec::new();
+    let mut kept_items: Vec<T> = Vec::new();
+    for item in items {
+        let set = word_trigrams(content_of(&item));
+        if !kept_sets.iter().any(|kept| jaccard(kept, &set) > threshold) {
+            kept_sets.push(set);
+            kept_items.push(item);
+        }
+    }
+    kept_items
+}
+
+fn word_trigrams(text: &str) -> HashSet<String> {
+    let lowered = text.to_lowercase();
+    let words: Vec<&str> = lowered
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let mut set = HashSet::new();
+    if words.len() < 3 {
+        // Degenerate input: fall back to the whole normalized text so tiny
+        // snippets still compare meaningfully instead of collapsing to an
+        // empty set.
+        if !words.is_empty() {
+            set.insert(words.join(" "));
+        }
+        return set;
+    }
+    for window in words.windows(3) {
+        set.insert(window.join(" "));
+    }
+    set
+}
+
+fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    let intersection = a.intersection(b).count();
+    let union = a.len() + b.len() - intersection;
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
+}
+
 /// Age-decay factor: 1.0 today, e^-1 at 30 days; future-dated clamps to 1.0.
 pub fn recency_boost(mtime_ms: i64, now_ms: i64) -> f64 {
     let age_days = ((now_ms - mtime_ms) as f64 / DAY_MS).max(0.0);
@@ -109,9 +177,9 @@ const RERANK_PROMPT: &str = "You are a search result reranker. \
 Rate each document's relevance to the query on a scale of 0-10. \
 Respond with ONLY a JSON array of numbers, one per document, in order.";
 
-struct Scored {
-    hit: ChunkHit,
-    score: f64,
+pub struct Scored {
+    pub hit: ChunkHit,
+    pub score: f64,
 }
 
 pub struct SearchService {

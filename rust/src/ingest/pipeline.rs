@@ -207,10 +207,96 @@ impl IndexPipeline {
             .collect();
         self.store.replace_edges(&record.rel_path, &targets).await?;
 
+        // Knowledge-graph extraction (wave 3): derive entities and typed
+        // relations from document structure and upsert them best-effort —
+        // extraction failures are logged but never fail indexing.
+        if let Err(err) = self.extract_kg(&record, &chunks).await {
+            eprintln!("kg extraction failed for {}: {err}", record.rel_path);
+        }
         if self.flags.embedder().is_some() && !chunks.is_empty() {
             let _ = self.embed_tx.send(record.id.clone());
         }
         Ok(())
+    }
+
+    /// Derive KG nodes/edges for an indexed document: structure-based entity
+    /// candidates (`services::kg::extract_entities_from_doc`), typed
+    /// relations (`extract_relations`), with a supersede pass that expires
+    /// this document's previous relation generation first so re-indexing
+    /// never accumulates stale edges.
+    async fn extract_kg(&self, record: &DocumentRecord, chunks: &[crate::domain::ChunkInput]) -> Result<()> {
+        let mut heading_paths: Vec<String> = Vec::new();
+        for chunk in chunks {
+            if let Some(hp) = &chunk.heading_path {
+                if !heading_paths.contains(hp) {
+                    heading_paths.push(hp.clone());
+                }
+            }
+        }
+        let title = record.title.clone().unwrap_or_else(|| record.rel_path.clone());
+        let frontmatter = record.frontmatter.clone();
+        let rel_path = record.rel_path.clone();
+        let wikilinks = record.outgoing_links.clone();
+
+        let entities =
+            crate::services::kg::extract_entities_from_doc(&title, &heading_paths, &wikilinks, &frontmatter);
+        for (name, entity_type) in entities {
+            let id = kg_entity_id(&name);
+            self.store.upsert_entity(&id, &name, &entity_type, &rel_path).await?;
+        }
+
+        // Supersede: expire relations sourced from this document before
+        // writing the fresh generation (append-only; old rows keep history).
+        // Probe both keying forms so earlier generations written under either
+        // convention are still invalidated.
+        self.store.invalidate_relations_for_entity(&rel_path).await?;
+        self.store.invalidate_relations_for_entity(&format!("/{}", record.rel_path.trim_end_matches(".md"))).await?;
+        let relations = crate::services::kg::extract_relations(&rel_path, &title, &wikilinks, &frontmatter);
+        if !relations.is_empty() {
+            let now = chrono::Utc::now().to_rfc3339();
+            for (src, dst, relation_type, fact) in relations {
+                // Resolve both endpoints into the shared document-node
+                // namespace (`/wiki/tokio`), so bare wikilink targets join
+                // the same graph nodes as their documents.
+                let src = self.resolve_node_key(&rel_path, &src).await;
+                let dst = self.resolve_node_key(&rel_path, &dst).await;
+                let edge = crate::services::kg::RelationRecord {
+                    id: format!("rel-{}", &ulid::Ulid::new().to_string()[..12].to_lowercase()),
+                    src_entity: src,
+                    dst_entity: dst,
+                    relation_type,
+                    fact,
+                    source_doc: rel_path.clone(),
+                    valid_at: Some(now.clone()),
+                    invalid_at: None,
+                    expired_at: None,
+                };
+                self.store.upsert_relation(&edge).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Map an entity/relation endpoint onto a real document's node key when
+    /// one exists (`/tokio` or `tokio` -> `/wiki/tokio`); otherwise return
+    /// the normalized raw form so cross-folder links still connect somewhere.
+    async fn resolve_node_key(&self, source_rel: &str, endpoint: &str) -> String {
+        let raw = endpoint.trim_start_matches('/').trim_end_matches(".md").to_string();
+        if self.store.get_document(&format!("{raw}.md")).await.ok().flatten().is_some() {
+            return format!("/{raw}");
+        }
+        let dir = std::path::Path::new(source_rel)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("")
+            .trim_end_matches('/');
+        if !dir.is_empty() {
+            let candidate = format!("{dir}/{raw}.md");
+            if self.store.get_document(&candidate).await.ok().flatten().is_some() {
+                return format!("/{}", candidate.trim_end_matches(".md"));
+            }
+        }
+        format!("/{raw}")
     }
 
     async fn read_fs_document(&self, rel_path: &str) -> Result<Option<DocumentInput>> {
@@ -443,6 +529,15 @@ fn extract_json(raw: &str) -> &str {
 
 // ---------------------------------------------------------------------------
 // helpers
+
+/// Normalize an extracted entity name into a stable KG node id: no leading
+/// `/`, no `.md` suffix, trimmed (mirrors `services::kg::norm_path`, which is
+/// private to that module).
+fn kg_entity_id(name: &str) -> String {
+    let n = name.trim().trim_start_matches('/');
+    n.strip_suffix(".md").unwrap_or(n).to_string()
+}
+
 // ---------------------------------------------------------------------------
 
 fn build_chunks(record: &DocumentRecord) -> Vec<ChunkInput> {

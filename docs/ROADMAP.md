@@ -184,3 +184,45 @@ broadcaster, attribution on every mutation, DB is disposable cache.
 - Google Cloud, Open Knowledge Format spec v0.2 — bundle structure, required `type`,
   `sources`/`generated`/`verified`/`status`/`stale_after`, actor convention, Attested
   Computations, permissive conformance, `okf_version`.
+
+## 7. Phase G — Foundation-derived memory loop (shipped, 2026-08-22)
+
+Foundation-derived agent memory on top of the Phase A–F substrate. Rust-first:
+the memory/session, version-history, community, and gap subsystems live in the
+`rust/` tree only; the TypeScript tree continues serving its pre-existing
+surface.
+
+- [x] Append-only document revisions (`document_revisions`) captured on every
+      API write, delete, batch delete, and watcher-observed external edit;
+      `GET /v1/pages/:rel_path/versions`, `/versions/:seq`, and a local-LCS
+      unified `diff?from=&to=` endpoint (seq | hash | current).
+- [x] Agent memory ledger: dedupe/update semantics with an append-only
+      mutation record for every outcome (add/update/delete/noop), source
+      provenance (`source_session_id`, `source_ref`), escaped-LIKE memory
+      search with access bumping; `/v1/memory` + history + delete routes.
+- [x] Sessions API (`/v1/sessions`): scoped memory injection at start,
+      per-message fact extraction (strict-JSON LLM prompt with heuristic
+      fallback, md5 bug removed, `preference` type added).
+- [x] Coding-agent transcript sync: watermark-based incremental ingestion of
+      Claude Code / Codex `*.jsonl` transcripts with prefix-hash rewrite
+      detection and rescan handling.
+- [x] Retrieval upgrade: RRF fusion across per-tool ranked lists, near-dup
+      collapse, CRAG retrieval guard with rewrite round + abstention
+      (`abstained` flag), latest-state guidance in planner/synthesis prompts,
+      embedding-similarity RAPTOR clustering, `queries.top_paths` populated.
+- [x] Knowledge graph: rewritten traversal over typed relations, label-
+      propagation community detection with TTL cache (`/v1/communities`),
+      entity/relation extraction wired into the indexing pipeline with
+      supersede-on-reindex.
+- [x] Promotion pipeline: candidate clustering (embeddings or Jaccard),
+      LLM-synthesized draft pages with provenance frontmatter, draft
+      exclusion from default search; gated by `promotion_enabled`.
+- [x] Improver loop: staleness scan with append-only refresh proposals to
+      `log.md`, cost-capped memory hygiene passes.
+- [x] Corpus-gap report: zero-hit query aggregation at `GET /v1/admin/gaps`.
+- [x] Eval harness: `scripts/memory_eval.py` (fact recall, preference
+      following, procedural recall, latest-state, abstention).
+- [x] MCP surface extended with the memory-loop tools: `memory_store`,
+      `memory_search`, `memory_history`, `session_start`, `session_message`,
+      `session_get`, `page_versions`, `page_diff`, `gaps_report`,
+      `communities_list`, `communities_docs`, `promote_run`.
